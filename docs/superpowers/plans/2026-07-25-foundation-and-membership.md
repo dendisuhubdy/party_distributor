@@ -2132,8 +2132,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 Create `app/api/auth/[...nextauth]/route.ts`:
 
 ```ts
-export { GET, POST } from '@/lib/auth'
+import { handlers } from '@/lib/auth'
+
+// NextAuth returns its route handlers grouped under `handlers`; they are not
+// individually named exports of lib/auth, so they have to be destructured here.
+export const { GET, POST } = handlers
 ```
+
+`export { GET, POST } from '@/lib/auth'` does not work — `lib/auth.ts` exports `handlers`, `auth`, `signIn` and `signOut`, and nothing named `GET`.
 
 **Do not add a `middleware.ts` that calls `auth()`.** Next.js middleware runs in the Edge runtime, and this `auth()` is bound to a Drizzle adapter backed by `postgres.js`, which opens TCP sockets and cannot run there. Importing it from middleware produces a confusing runtime failure rather than a clean build error.
 
@@ -2251,16 +2257,83 @@ docker compose exec -T db psql -U party -d party -c \
 
 Step 4 is the membership gate, and it is the single most important behaviour in this task. If a stranger gets a link, or a `users` row appears for them, the `signIn` callback is not doing its job — stop and fix it before continuing.
 
-**Dev escape hatch.** To sign in as any *seeded* member without receiving mail — which you will need constantly, since the test sender reaches only one inbox — read the token straight from the database and build the callback URL:
+**Dev escape hatch.** To sign in as any *seeded* member without waiting on mail, mint a session row directly.
 
-```bash
-docker compose exec -T db psql -U party -d party -t -A -F' ' -c \
-  "select identifier, token from verification_tokens order by expires desc limit 1"
+Reading `verification_tokens` and building a callback URL **does not work**, though it looks like it should. Auth.js stores `hashToken(rawToken)` — a 64-character sha256 digest — while the emailed link carries the raw token. Feeding the stored value to the callback returns `error=Verification` and creates no session. This was verified by trying it.
+
+Because `session: { strategy: 'database' }` is configured, a session is just one row plus one cookie. Create `scripts/load-env.ts`:
+
+```ts
+import { config } from 'dotenv'
+
+/**
+ * Loads `.env.local`, then `.env` as a fallback. Earlier entries win.
+ *
+ * This must be its own module, imported *before* anything that reads
+ * `process.env` at import time — `lib/db/client.ts` throws if `DATABASE_URL`
+ * is unset the moment it is evaluated. Calling `config()` in a script's own
+ * module body is too late: ES module bodies run after every import in the
+ * graph has already been evaluated. Importing a side-effect module first works
+ * because imports are evaluated in declaration order.
+ */
+config({ path: ['.env.local', '.env'] })
 ```
 
-Then visit `http://localhost:3000/api/auth/callback/resend?token=<token>&email=<identifier>`.
+Create `scripts/dev-session.ts`:
 
-This works because the gate is enforced at *request* time, not at delivery time: a token only exists for an address that already passed the `signIn` callback. Reading it out of the database bypasses your inbox, not the membership check.
+```ts
+// Must come first: it populates process.env before lib/db/client is evaluated.
+import './load-env'
+
+import { randomUUID } from 'node:crypto'
+import { eq } from 'drizzle-orm'
+import { db } from '@/lib/db/client'
+import { sessions, users } from '@/lib/db/schema'
+
+/** Development only. Nothing in the app imports this. */
+async function main() {
+  const email = (process.argv[2] ?? process.env.FOUNDER_EMAIL ?? '').trim().toLowerCase()
+  if (!email) throw new Error('Usage: npm run dev:session -- you@example.com')
+
+  const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1)
+  if (!user) throw new Error(`No member with email ${email}. Redeem an invite or seed one first.`)
+  if (user.status !== 'active') throw new Error(`${email} is ${user.status}, so they cannot sign in.`)
+
+  const sessionToken = randomUUID()
+  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000)
+  await db.insert(sessions).values({ sessionToken, userId: user.id, expires })
+
+  console.log(`signed in as ${user.name} <${email}> until ${expires.toISOString()}`)
+  console.log()
+  console.log('In the browser devtools console on http://localhost:3000:')
+  console.log(`  document.cookie = 'authjs.session-token=${sessionToken}; path=/'`)
+}
+
+main().then(() => process.exit(0)).catch((error) => {
+  console.error(error instanceof Error ? error.message : error)
+  process.exit(1)
+})
+```
+
+```bash
+npm install -D tsx
+```
+
+Add to `package.json` scripts:
+
+```json
+"dev:session": "tsx --tsconfig tsconfig.json scripts/dev-session.ts"
+```
+
+Confirm it works:
+
+```bash
+npm run dev:session -- you@example.com
+curl -s -H 'Cookie: authjs.session-token=<the token it printed>' \
+  http://localhost:3000/api/auth/session
+```
+
+Expected: a JSON session whose `user.id` is the member's uuid. Anonymously, the same endpoint returns `null`. The cookie is unprefixed over plain HTTP; over HTTPS it becomes `__Secure-authjs.session-token`.
 
 - [ ] **Step 6: Commit**
 
@@ -2648,7 +2721,10 @@ Invite codes require an inviter, so the first member cannot be created by the no
 Create `scripts/seed.ts`:
 
 ```ts
-import 'dotenv/config'
+// Must come first: `dotenv/config` reads only `.env`, and the secrets live in
+// `.env.local`. See scripts/load-env.ts, added in Task 7.
+import './load-env'
+
 import { eq } from 'drizzle-orm'
 import { db } from '@/lib/db/client'
 import { users, venues } from '@/lib/db/schema'
