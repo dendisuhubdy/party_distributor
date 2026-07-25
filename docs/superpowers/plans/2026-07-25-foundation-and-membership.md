@@ -2884,8 +2884,9 @@ Modify `next.config.ts`:
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  // Emits .next/standalone with only the files the server actually needs,
-  // which keeps the production image around 150MB instead of 1GB.
+  // Emits .next/standalone with only the files the server actually needs.
+  // Measured: a ~277MB runner image, against well over 1GB if the full
+  // node_modules tree were copied in.
   output: 'standalone',
 }
 
@@ -2935,8 +2936,15 @@ node_modules
 .env*
 docs
 tests
-drizzle/meta
+e2e
+
+# drizzle/ is deliberately NOT ignored, and neither is drizzle/meta.
+# `drizzle-kit migrate` reads drizzle/meta/_journal.json to discover which
+# migrations exist. Without it the migrate container finds nothing to apply,
+# succeeds silently, and the web service starts against an empty database.
 ```
+
+**`drizzle/meta` must not be excluded.** An earlier draft of this plan listed it here, which would have made the very first production deploy bring up a web service against an empty schema — with a migrate step that reported success. Verified by building the `builder` target and confirming `drizzle/meta/_journal.json` is present inside it.
 
 The `builder` stage is kept as a named target rather than discarded, because migrations need `drizzle-kit` and `tsx` — both devDependencies absent from the slim runner image.
 

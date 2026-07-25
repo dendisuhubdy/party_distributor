@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.env*
+docs
+tests
+e2e
+
+# drizzle/ is deliberately NOT ignored, and neither is drizzle/meta.
+# `drizzle-kit migrate` reads drizzle/meta/_journal.json to discover which
+# migrations exist. Without it the migrate container finds nothing to apply,
+# succeeds silently, and the web service starts against an empty database.
