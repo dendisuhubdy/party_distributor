@@ -2383,3 +2383,567 @@ git push
 ```
 
 ---
+
+### Task 8: The Resend sender and the email log
+
+**Files:**
+- Create: `lib/db/repositories/email-log.ts`, `lib/email/resend-sender.ts`, `lib/notify-service.ts`
+- Modify: `.env.example`
+- Test: `tests/integration/email-log-repository.test.ts`
+
+**Interfaces:**
+- Consumes: `EmailLogRepository`, `RecipientRepository`, `EmailSender`, `NotifyDeps` (Task 7).
+- Produces: `PostgresEmailLogRepository`, `PostgresRecipientRepository`, `ResendEmailSender`, `notifyDeps`.
+
+- [ ] **Step 1: Write the failing integration tests**
+
+Create `tests/integration/email-log-repository.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { db } from '@/lib/db/client'
+import { PostgresEmailLogRepository, PostgresRecipientRepository } from '@/lib/db/repositories/email-log'
+import { seedUser, truncateAll } from '../support/db-helpers'
+import { users } from '@/lib/db/schema'
+import { eq } from 'drizzle-orm'
+
+const log = new PostgresEmailLogRepository(db)
+const recipients = new PostgresRecipientRepository(db)
+
+const AT = new Date('2026-08-01T12:00:00.000Z')
+
+let aliceId: string
+let bobId: string
+
+beforeEach(async () => {
+  await truncateAll()
+  aliceId = (await seedUser({ email: 'alice@example.com', name: 'Alice' })).id
+  bobId = (await seedUser({ email: 'bob@example.com', name: 'Bob' })).id
+})
+
+describe('claim', () => {
+  it('succeeds the first time and fails the second', async () => {
+    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(false)
+  })
+
+  it('treats each recipient separately', async () => {
+    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', 'request-1', bobId, AT)).toBe(true)
+  })
+
+  it('treats each kind and entity separately', async () => {
+    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_removed', 'request-1', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', 'request-2', aliceId, AT)).toBe(true)
+  })
+
+  it('lets exactly one of two simultaneous claims win', async () => {
+    const [first, second] = await Promise.all([
+      log.claim('new_listing', 'listing-1', aliceId, AT),
+      log.claim('new_listing', 'listing-1', aliceId, AT),
+    ])
+
+    expect([first, second].filter(Boolean)).toHaveLength(1)
+  })
+})
+
+describe('release', () => {
+  it('frees a claim so it can be taken again', async () => {
+    await log.claim('seat_approved', 'request-1', aliceId, AT)
+
+    await log.release('seat_approved', 'request-1', aliceId)
+
+    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
+  })
+
+  it('is harmless when there is nothing to release', async () => {
+    await expect(log.release('seat_approved', 'never-claimed', aliceId)).resolves.toBeUndefined()
+  })
+
+  it('releases only the claim it names', async () => {
+    await log.claim('seat_approved', 'request-1', aliceId, AT)
+    await log.claim('seat_approved', 'request-1', bobId, AT)
+
+    await log.release('seat_approved', 'request-1', aliceId)
+
+    expect(await log.claim('seat_approved', 'request-1', bobId, AT)).toBe(false)
+  })
+})
+
+describe('recipients', () => {
+  it('finds one member', async () => {
+    expect(await recipients.findRecipient(aliceId)).toEqual({
+      userId: aliceId, email: 'alice@example.com', name: 'Alice',
+    })
+  })
+
+  it('finds several at once', async () => {
+    const found = await recipients.findRecipients([aliceId, bobId])
+
+    expect(found.map((r) => r.name).sort()).toEqual(['Alice', 'Bob'])
+  })
+
+  it('returns nothing for an empty list rather than every member', async () => {
+    expect(await recipients.findRecipients([])).toEqual([])
+  })
+
+  it('lists everyone active', async () => {
+    expect(await recipients.listActiveRecipients()).toHaveLength(2)
+  })
+
+  it('never emails a suspended member', async () => {
+    await db.update(users).set({ status: 'suspended' }).where(eq(users.id, bobId))
+
+    expect(await recipients.findRecipient(bobId)).toBeNull()
+    expect(await recipients.findRecipients([aliceId, bobId])).toHaveLength(1)
+    expect(await recipients.listActiveRecipients()).toHaveLength(1)
+  })
+})
+```
+
+The "empty list" test guards a real trap: `inArray(column, [])` compiles to `in ()`, which some Drizzle versions emit as invalid SQL and others as a condition that matches nothing. Neither is what a caller wants, and the version that matched *everything* would email the entire membership.
+
+The simultaneous-claim test is what proves the idempotency is enforced by the database rather than by a read-then-write in application code.
+
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+```bash
+npm run test:integration
+```
+
+Expected: failure resolving `@/lib/db/repositories/email-log`.
+
+- [ ] **Step 3: Implement the repositories**
+
+Create `lib/db/repositories/email-log.ts`:
+
+```ts
+import { and, eq, inArray } from 'drizzle-orm'
+import type { Db } from '../client'
+import { emailLog, users } from '../schema'
+import type { EmailLogRepository, RecipientRepository } from '@/lib/domain/notify/ports'
+import type { EmailKind, Recipient } from '@/lib/domain/notify/types'
+
+export class PostgresEmailLogRepository implements EmailLogRepository {
+  constructor(private readonly db: Db) {}
+
+  async claim(kind: EmailKind, entityId: string, toUserId: string, at: Date): Promise<boolean> {
+    // The whole idempotency mechanism: `unique(kind, entity_id, to_user_id)`
+    // turns a duplicate into zero returned rows rather than a second email.
+    const inserted = await this.db.insert(emailLog)
+      .values({ kind, entityId, toUserId, sentAt: at })
+      .onConflictDoNothing()
+      .returning({ id: emailLog.id })
+
+    return inserted.length > 0
+  }
+
+  async release(kind: EmailKind, entityId: string, toUserId: string): Promise<void> {
+    await this.db.delete(emailLog).where(and(
+      eq(emailLog.kind, kind),
+      eq(emailLog.entityId, entityId),
+      eq(emailLog.toUserId, toUserId),
+    ))
+  }
+}
+
+const RECIPIENT_COLUMNS = {
+  userId: users.id,
+  email: users.email,
+  name: users.name,
+}
+
+export class PostgresRecipientRepository implements RecipientRepository {
+  constructor(private readonly db: Db) {}
+
+  async findRecipient(userId: string): Promise<Recipient | null> {
+    const [row] = await this.db.select(RECIPIENT_COLUMNS).from(users)
+      .where(and(eq(users.id, userId), eq(users.status, 'active')))
+      .limit(1)
+    return row ?? null
+  }
+
+  async findRecipients(userIds: string[]): Promise<Recipient[]> {
+    // `inArray(column, [])` is not portable — depending on the Drizzle version
+    // it emits invalid SQL or a predicate that matches everything. Returning
+    // early is the only safe reading of "notify nobody".
+    if (userIds.length === 0) return []
+
+    return this.db.select(RECIPIENT_COLUMNS).from(users)
+      .where(and(inArray(users.id, userIds), eq(users.status, 'active')))
+  }
+
+  async listActiveRecipients(): Promise<Recipient[]> {
+    return this.db.select(RECIPIENT_COLUMNS).from(users).where(eq(users.status, 'active'))
+  }
+}
+```
+
+Every query filters on `status = 'active'`. A suspended member cannot sign in, so any link mailed to them is dead on arrival — and since suspension is a manual database operation with no UI, silently continuing to email them would make the one moderation tool in the product feel broken.
+
+- [ ] **Step 4: Implement the sender**
+
+Create `lib/email/resend-sender.ts`:
+
+```ts
+import { Resend } from 'resend'
+import type { EmailSender } from '@/lib/domain/notify/ports'
+import type { EmailMessage } from '@/lib/domain/notify/types'
+
+export class ResendEmailSender implements EmailSender {
+  private readonly client: Resend
+
+  constructor(apiKey: string, private readonly from: string) {
+    this.client = new Resend(apiKey)
+  }
+
+  async send(message: EmailMessage): Promise<void> {
+    const { error } = await this.client.emails.send({
+      from: this.from,
+      to: message.to.email,
+      subject: message.subject,
+      text: message.text,
+    })
+
+    // The Resend SDK resolves with `{ data, error }` instead of rejecting. Not
+    // checking `error` would make every failure look like a success, and
+    // dispatch would record the email as sent and never retry it.
+    if (error) {
+      throw new Error(`Resend refused the message: ${error.name}: ${error.message}`)
+    }
+  }
+}
+```
+
+- [ ] **Step 5: Wire it up**
+
+Create `lib/notify-service.ts`:
+
+```ts
+import { db } from '@/lib/db/client'
+import { PostgresEmailLogRepository, PostgresRecipientRepository } from '@/lib/db/repositories/email-log'
+import { ResendEmailSender } from '@/lib/email/resend-sender'
+import type { NotifyDeps } from '@/lib/domain/notify/ports'
+
+function baseUrl(): string {
+  const raw = process.env.APP_URL ?? process.env.AUTH_URL ?? 'http://localhost:3000'
+  // Templates build `${baseUrl}/tables/...`, so a trailing slash would produce
+  // a double slash in every link in every email.
+  return raw.replace(/\/+$/, '')
+}
+
+export const notifyDeps: NotifyDeps = {
+  sender: new ResendEmailSender(process.env.RESEND_API_KEY ?? '', process.env.EMAIL_FROM ?? ''),
+  log: new PostgresEmailLogRepository(db),
+  recipients: new PostgresRecipientRepository(db),
+  now: () => new Date(),
+  baseUrl: baseUrl(),
+}
+```
+
+Add to `.env.example`:
+
+```
+# Public origin, used to build links inside emails. No trailing slash.
+APP_URL=http://localhost:3000
+```
+
+- [ ] **Step 6: Run the integration tests**
+
+```bash
+npm run test:integration
+```
+
+Expected: all email-log tests pass.
+
+- [ ] **Step 7: Commit and push**
+
+```bash
+git add lib/db/repositories/email-log.ts lib/email lib/notify-service.ts .env.example tests/integration/email-log-repository.test.ts
+git commit -m "feat: add Postgres email log, recipients, and the Resend sender"
+git push
+```
+
+---
+
+### Task 9: Wire notifications into every flow
+
+Everything up to here could send email. Nothing does. This task connects them, and every connection is best-effort: a mail failure must never unwind something that already committed.
+
+**Files:**
+- Create: `lib/notifications.ts`
+- Modify: `app/tables/new/actions.ts`, `app/tables/[id]/actions.ts`, `app/tables/[id]/manage/actions.ts`
+
+**Interfaces:**
+- Consumes: templates (Task 6), `dispatch` (Task 7), `notifyDeps` (Task 8), `tablesDeps`/`seatsDeps` (Plan 2 Task 10).
+- Produces: `notifyNewListing(listingId)`, `notifySeatRequested(requestId)`, `notifySeatDecision(requestId, decision)`, `notifyListingCancelled(listingId, userIds)` — all returning `Promise<void>` and never throwing.
+
+- [ ] **Step 1: Build the notification adapter**
+
+Create `lib/notifications.ts`:
+
+```ts
+import { dispatch, type DispatchResult } from '@/lib/domain/notify/dispatch'
+import {
+  listingCancelledEmail, newListingEmail, seatApprovedEmail, seatDeclinedEmail,
+  seatRemovedEmail, seatRequestedEmail,
+} from '@/lib/domain/notify/templates'
+import type { EmailMessage, ListingDigest } from '@/lib/domain/notify/types'
+import { notifyDeps } from '@/lib/notify-service'
+import { seatsDeps } from '@/lib/seats-service'
+import { tablesDeps } from '@/lib/tables-service'
+
+const ctx = { baseUrl: notifyDeps.baseUrl }
+
+/**
+ * Translate a listing into the flat value `notify` accepts. This function is
+ * the boundary the module rule protects: `notify` never imports `tables`, so
+ * something on this side has to do the conversion.
+ */
+async function digestFor(listingId: string): Promise<ListingDigest | null> {
+  const summary = await tablesDeps.repository.findListingSummary(listingId)
+  if (!summary) return null
+
+  return {
+    listingId: summary.listing.id,
+    venueName: summary.venue.name,
+    eventName: summary.listing.eventName,
+    startsAt: summary.listing.startsAt,
+    seatPrice: summary.listing.seatPrice,
+    hostName: summary.host.name,
+    paymentLink: summary.listing.paymentLink,
+    paymentNote: summary.listing.paymentNote,
+  }
+}
+
+/**
+ * Send, and swallow everything.
+ *
+ * Callers invoke this after their database work has already committed. An
+ * exception escaping here would surface to the host as a failed approval that
+ * in fact succeeded, which is strictly worse than a missing email.
+ */
+async function send(messages: EmailMessage[], label: string): Promise<void> {
+  if (messages.length === 0) return
+
+  let result: DispatchResult
+  try {
+    result = await dispatch(notifyDeps, messages)
+  } catch (error) {
+    console.error(`[notify] ${label} dispatch threw`, error)
+    return
+  }
+
+  for (const failure of result.failed) {
+    console.error(`[notify] ${label} to ${failure.message.to.email} failed`, failure.error)
+  }
+}
+
+export async function notifyNewListing(listingId: string): Promise<void> {
+  const listing = await digestFor(listingId)
+  if (!listing) return
+
+  const everyone = await notifyDeps.recipients.listActiveRecipients()
+  const summary = await tablesDeps.repository.findListingSummary(listingId)
+
+  const messages = everyone
+    // The host already knows. Emailing them their own announcement is the
+    // fastest way to make the product feel like a mailing list.
+    .filter((to) => to.userId !== summary?.listing.hostId)
+    .map((to) => newListingEmail(ctx, { listing, to }))
+
+  await send(messages, 'new_listing')
+}
+
+export async function notifySeatRequested(requestId: string): Promise<void> {
+  const request = await seatsDeps.repository.findRequestById(requestId)
+  if (!request) return
+
+  const listing = await digestFor(request.tableId)
+  if (!listing) return
+
+  const [host, guest] = await Promise.all([
+    notifyDeps.recipients.findRecipient(request.hostId),
+    notifyDeps.recipients.findRecipient(request.userId),
+  ])
+  if (!host || !guest) return
+
+  await send([seatRequestedEmail(ctx, {
+    listing, to: host, requestId: request.id, guestName: guest.name, message: request.message,
+  })], 'seat_requested')
+}
+
+export async function notifySeatDecision(
+  requestId: string,
+  decision: 'approved' | 'declined' | 'removed',
+): Promise<void> {
+  const request = await seatsDeps.repository.findRequestById(requestId)
+  if (!request) return
+
+  const listing = await digestFor(request.tableId)
+  if (!listing) return
+
+  const to = await notifyDeps.recipients.findRecipient(request.userId)
+  if (!to) return
+
+  const template = decision === 'approved'
+    ? seatApprovedEmail
+    : decision === 'declined'
+      ? seatDeclinedEmail
+      : seatRemovedEmail
+
+  await send([template(ctx, { listing, to, requestId: request.id })], `seat_${decision}`)
+}
+
+export async function notifyListingCancelled(listingId: string, userIds: string[]): Promise<void> {
+  const listing = await digestFor(listingId)
+  if (!listing) return
+
+  const people = await notifyDeps.recipients.findRecipients(userIds)
+  await send(people.map((to) => listingCancelledEmail(ctx, { listing, to })), 'listing_cancelled')
+}
+```
+
+- [ ] **Step 2: Announce a new listing**
+
+In `app/tables/new/actions.ts`, import the notifier:
+
+```ts
+import { notifyNewListing } from '@/lib/notifications'
+```
+
+After the `try/catch` block and before `revalidatePath('/')`:
+
+```ts
+  await notifyNewListing(listingId)
+```
+
+Placing it after the `catch` matters twice over: the listing is already committed, and `notifyNewListing` cannot throw, so nothing here can turn a created table into a rendered error.
+
+- [ ] **Step 3: Tell the host about a request**
+
+In `app/tables/[id]/actions.ts`, import the notifier and capture the request:
+
+```ts
+import { notifySeatRequested } from '@/lib/notifications'
+```
+
+In `requestSeatAction`, change the body so the created request is available afterwards:
+
+```ts
+  let requestId: string
+  try {
+    const request = await requestSeat(seatsDeps, {
+      listingId,
+      userId,
+      message: String(formData.get('message') ?? '') || null,
+    })
+    requestId = request.id
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  await notifySeatRequested(requestId)
+  revalidateListing(listingId)
+  return {}
+```
+
+- [ ] **Step 4: Tell the guest about a decision**
+
+In `app/tables/[id]/manage/actions.ts`, import the notifiers:
+
+```ts
+import { notifyListingCancelled, notifySeatDecision } from '@/lib/notifications'
+```
+
+In `decideAction`, remember which decision landed and notify after the `catch`:
+
+```ts
+  let decided: 'approved' | 'declined' | 'removed'
+  try {
+    if (decision === 'approve') { await approveSeat(seatsDeps, { requestId, hostId }); decided = 'approved' }
+    else if (decision === 'decline') { await declineSeat(seatsDeps, { requestId, hostId }); decided = 'declined' }
+    else if (decision === 'remove') { await removeSeat(seatsDeps, { requestId, hostId }); decided = 'removed' }
+    else return { error: 'Unknown action.' }
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  await notifySeatDecision(requestId, decided)
+  revalidateListing(listingId)
+  return {}
+```
+
+In `cancelListingAction`, keep the cascade rather than discarding it:
+
+```ts
+  let affected: string[]
+  try {
+    const cascade = await cancelListing(tablesDeps, { listingId, hostId })
+    // Both groups are told. The removed guests may be owed money; the declined
+    // ones were only waiting, and their email says so more gently.
+    affected = [...cascade.removedUserIds, ...cascade.declinedUserIds]
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  await notifyListingCancelled(listingId, affected)
+  revalidateListing(listingId)
+  redirect(`/tables/${listingId}`)
+```
+
+- [ ] **Step 5: Verify end to end with real email**
+
+This needs `RESEND_API_KEY` set and `EMAIL_FROM` pointing at a sender that can reach your inbox. Until `wazup.party` is verified in Resend, that means the address registered on the Resend account — see Plan 1 Task 11.
+
+```bash
+npm run dev
+```
+
+1. List a table as one member → every *other* active member gets "New table at …". The host gets nothing.
+2. Ask for a seat as a second member → the host gets "… wants a seat at …" with the note included and a link to `/manage`.
+3. Approve → the guest gets "You're in at …" with the amount and the payment link.
+4. Decline a different request → that guest gets "No seat this time".
+5. Cancel the table → every approved and pending guest gets "Cancelled: …".
+
+Then confirm the log recorded exactly one row per email:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select kind, count(*) from email_log group by kind order by kind"
+```
+
+- [ ] **Step 6: Prove the idempotency, and prove email cannot break the app**
+
+Approve the same seat twice by replaying the form (the second attempt is refused by the domain, so instead remove and re-approve the guest, then check the count):
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select kind, entity_id, count(*) from email_log group by kind, entity_id having count(*) > 1"
+```
+
+Expected: no rows. One email per kind per entity per recipient, always.
+
+Then break the sender deliberately — set `RESEND_API_KEY=invalid` in `.env.local`, restart, and approve a seat:
+
+Expected: the approval **succeeds**, the guest appears on the roster, a `[notify]` error is logged to the terminal, and `email_log` gains no row for it — so a retry after fixing the key would still send. If the approval fails instead, something is throwing where it must not; the `send` helper in `lib/notifications.ts` is the place to look. **Restore the key afterwards.**
+
+- [ ] **Step 7: Run everything**
+
+```bash
+npm test && npm run test:integration && npm run lint && npm run build
+```
+
+- [ ] **Step 8: Commit and push**
+
+```bash
+git add lib/notifications.ts app/tables
+git commit -m "feat: send email on new listings, requests, decisions, and cancellations"
+git push
+```
+
+---
