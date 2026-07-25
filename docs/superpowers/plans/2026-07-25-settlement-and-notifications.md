@@ -1586,3 +1586,800 @@ git push
 ```
 
 ---
+
+### Task 6: Email templates
+
+`notify` is the one module that imports none of the others. It receives digests and returns messages — it never reaches back into tables, seats, or settlement.
+
+**Files:**
+- Create: `lib/domain/notify/types.ts`, `lib/domain/notify/templates.ts`
+- Test: `tests/domain/notify/templates.test.ts`
+
+**Interfaces:**
+- Consumes: `formatEventTime` (Plan 2 Task 2), `formatRupiah` (Plan 1 Task 2).
+- Produces: `EmailKind`, `Recipient`, `ListingDigest`, `EmailMessage`, `TemplateContext`; `newListingEmail`, `seatRequestedEmail`, `seatApprovedEmail`, `seatDeclinedEmail`, `seatRemovedEmail`, `listingCancelledEmail`, `eventReminderEmail` — each `(ctx, input) => EmailMessage`.
+
+- [ ] **Step 1: Define the notify types**
+
+Create `lib/domain/notify/types.ts`:
+
+```ts
+import type { Rupiah } from '../money'
+
+export type EmailKind =
+  | 'new_listing'
+  | 'seat_requested'
+  | 'seat_approved'
+  | 'seat_declined'
+  | 'seat_removed'
+  | 'listing_cancelled'
+  | 'event_reminder'
+
+export interface Recipient {
+  userId: string
+  email: string
+  name: string
+}
+
+/**
+ * Everything an email needs to know about a table. Deliberately a flat value
+ * rather than the `ListingSummary` the tables module uses: `notify` must not
+ * depend on any other module, so callers translate at the boundary.
+ */
+export interface ListingDigest {
+  listingId: string
+  venueName: string
+  eventName: string | null
+  startsAt: Date
+  seatPrice: Rupiah
+  hostName: string
+  paymentLink: string | null
+  paymentNote: string | null
+}
+
+export interface EmailMessage {
+  kind: EmailKind
+  /**
+   * The row this email is *about*. Together with `kind` and the recipient it
+   * forms the `email_log` uniqueness key, so choosing it wrongly is what turns
+   * "once per person" into "once per person per send attempt".
+   */
+  entityId: string
+  to: Recipient
+  subject: string
+  text: string
+}
+
+export interface TemplateContext {
+  /** No trailing slash. e.g. `https://wazup.party` */
+  baseUrl: string
+}
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `tests/domain/notify/templates.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import {
+  eventReminderEmail, listingCancelledEmail, newListingEmail, seatApprovedEmail,
+  seatDeclinedEmail, seatRemovedEmail, seatRequestedEmail,
+} from '@/lib/domain/notify/templates'
+import type { ListingDigest, Recipient } from '@/lib/domain/notify/types'
+
+const ctx = { baseUrl: 'https://wazup.party' }
+
+const to: Recipient = { userId: 'user-1', email: 'guest@example.com', name: 'Guest' }
+
+const listing: ListingDigest = {
+  listingId: 'listing-1',
+  venueName: 'Savaya',
+  eventName: 'Peggy Gou',
+  // 22:00 Bali on Saturday 15 August 2026.
+  startsAt: new Date('2026-08-15T14:00:00.000Z'),
+  seatPrice: 2_500_000,
+  hostName: 'Host',
+  paymentLink: 'https://pay.example/x',
+  paymentNote: 'GoPay to 0812',
+}
+
+describe('every template', () => {
+  const all = [
+    newListingEmail(ctx, { listing, to }),
+    seatRequestedEmail(ctx, { listing, to, requestId: 'request-1', guestName: 'Guest', message: null }),
+    seatApprovedEmail(ctx, { listing, to, requestId: 'request-1' }),
+    seatDeclinedEmail(ctx, { listing, to, requestId: 'request-1' }),
+    seatRemovedEmail(ctx, { listing, to, requestId: 'request-1' }),
+    listingCancelledEmail(ctx, { listing, to }),
+    eventReminderEmail(ctx, { listing, to, role: 'guest', outstanding: 2_500_000, approvedSeats: 3 }),
+  ]
+
+  it('renders the event time in Bali, never in UTC', () => {
+    for (const message of all) {
+      expect(message.text, `${message.kind} lost the Bali time`).toContain('Sat 15 Aug, 22:00')
+      expect(message.text).not.toContain('14:00')
+    }
+  })
+
+  it('links back to the table', () => {
+    for (const message of all) {
+      expect(message.text, `${message.kind} has no link`).toContain('https://wazup.party/tables/listing-1')
+    }
+  })
+
+  it('has a subject that says what happened without needing the body', () => {
+    for (const message of all) {
+      expect(message.subject.length, `${message.kind} subject is empty`).toBeGreaterThan(0)
+      expect(message.subject.length, `${message.kind} subject is too long`).toBeLessThanOrEqual(78)
+    }
+  })
+
+  it('addresses the recipient by name', () => {
+    for (const message of all) {
+      expect(message.text, `${message.kind} does not greet anyone`).toContain('Guest')
+    }
+  })
+
+  it('carries the recipient through unchanged', () => {
+    for (const message of all) {
+      expect(message.to).toEqual(to)
+    }
+  })
+})
+
+describe('entity ids', () => {
+  it('keys listing-wide emails on the listing', () => {
+    expect(newListingEmail(ctx, { listing, to }).entityId).toBe('listing-1')
+    expect(listingCancelledEmail(ctx, { listing, to }).entityId).toBe('listing-1')
+    expect(eventReminderEmail(ctx, {
+      listing, to, role: 'guest', outstanding: 0, approvedSeats: 1,
+    }).entityId).toBe('listing-1')
+  })
+
+  it('keys per-seat emails on the request', () => {
+    for (const message of [
+      seatRequestedEmail(ctx, { listing, to, requestId: 'request-1', guestName: 'G', message: null }),
+      seatApprovedEmail(ctx, { listing, to, requestId: 'request-1' }),
+      seatDeclinedEmail(ctx, { listing, to, requestId: 'request-1' }),
+      seatRemovedEmail(ctx, { listing, to, requestId: 'request-1' }),
+    ]) {
+      expect(message.entityId, `${message.kind} is keyed wrongly`).toBe('request-1')
+    }
+  })
+})
+
+describe('newListingEmail', () => {
+  it('leads with the venue, the price, and who is hosting', () => {
+    const message = newListingEmail(ctx, { listing, to })
+
+    expect(message.subject).toContain('Savaya')
+    expect(message.text).toContain('Rp 2.500.000')
+    expect(message.text).toContain('Host')
+  })
+
+  it('copes with a table that has no event name', () => {
+    const message = newListingEmail(ctx, { listing: { ...listing, eventName: null }, to })
+
+    expect(message.subject).toContain('Savaya')
+    expect(message.subject).not.toContain('null')
+    expect(message.text).not.toContain('null')
+  })
+})
+
+describe('seatRequestedEmail', () => {
+  it('tells the host who asked and what they said', () => {
+    const message = seatRequestedEmail(ctx, {
+      listing, to, requestId: 'request-1', guestName: 'Rina', message: 'Bringing a friend',
+    })
+
+    expect(message.subject).toContain('Rina')
+    expect(message.text).toContain('Bringing a friend')
+    expect(message.text).toContain('https://wazup.party/tables/listing-1/manage')
+  })
+
+  it('omits the note block entirely when there is none', () => {
+    const message = seatRequestedEmail(ctx, {
+      listing, to, requestId: 'request-1', guestName: 'Rina', message: null,
+    })
+
+    expect(message.text).not.toContain('null')
+    expect(message.text).not.toContain('They said:')
+  })
+})
+
+describe('seatApprovedEmail', () => {
+  it('carries the amount and how to pay', () => {
+    const message = seatApprovedEmail(ctx, { listing, to, requestId: 'request-1' })
+
+    expect(message.text).toContain('Rp 2.500.000')
+    expect(message.text).toContain('https://pay.example/x')
+    expect(message.text).toContain('GoPay to 0812')
+  })
+
+  it('still works when the host gave no payment details', () => {
+    const bare = { ...listing, paymentLink: null, paymentNote: null }
+    const message = seatApprovedEmail(ctx, { listing: bare, to, requestId: 'request-1' })
+
+    expect(message.text).toContain('Rp 2.500.000')
+    expect(message.text).not.toContain('null')
+    expect(message.text).toContain('Host')
+  })
+})
+
+describe('listingCancelledEmail', () => {
+  it('says the money question is between the two people', () => {
+    const message = listingCancelledEmail(ctx, { listing, to })
+
+    expect(message.subject.toLowerCase()).toContain('cancelled')
+    expect(message.text).toContain('Host')
+    expect(message.text.toLowerCase()).toContain('refund')
+  })
+})
+
+describe('eventReminderEmail', () => {
+  it('reminds a guest what they still owe', () => {
+    const message = eventReminderEmail(ctx, {
+      listing, to, role: 'guest', outstanding: 2_500_000, approvedSeats: 3,
+    })
+
+    expect(message.text).toContain('Rp 2.500.000')
+    expect(message.text.toLowerCase()).toContain('still')
+  })
+
+  it('tells a settled guest there is nothing to do', () => {
+    const message = eventReminderEmail(ctx, {
+      listing, to, role: 'guest', outstanding: 0, approvedSeats: 3,
+    })
+
+    expect(message.text.toLowerCase()).toContain('all settled')
+  })
+
+  it('tells a host how many people are coming and what is uncollected', () => {
+    const message = eventReminderEmail(ctx, {
+      listing, to, role: 'host', outstanding: 5_000_000, approvedSeats: 3,
+    })
+
+    expect(message.text).toContain('3')
+    expect(message.text).toContain('Rp 5.000.000')
+    expect(message.text).toContain('https://wazup.party/tables/listing-1/manage')
+  })
+})
+```
+
+The first test in the file — that no template renders `14:00` — is the one worth keeping forever. An email is the single place a timezone bug cannot be corrected after the fact, because the reader cannot refresh it.
+
+- [ ] **Step 3: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/notify/templates`.
+
+- [ ] **Step 4: Implement**
+
+Create `lib/domain/notify/templates.ts`:
+
+```ts
+import { formatEventTime } from '../event-time'
+import { formatRupiah, type Rupiah } from '../money'
+import type { EmailMessage, ListingDigest, Recipient, TemplateContext } from './types'
+
+interface Base {
+  listing: ListingDigest
+  to: Recipient
+}
+
+function listingUrl(ctx: TemplateContext, listing: ListingDigest): string {
+  return `${ctx.baseUrl}/tables/${listing.listingId}`
+}
+
+function manageUrl(ctx: TemplateContext, listing: ListingDigest): string {
+  return `${listingUrl(ctx, listing)}/manage`
+}
+
+/** "Savaya · Peggy Gou" or just "Savaya" — used in subjects, so it stays short. */
+function title(listing: ListingDigest): string {
+  return listing.eventName ? `${listing.venueName} · ${listing.eventName}` : listing.venueName
+}
+
+/** Joins the parts of a body, dropping any the caller omitted, with blank lines between. */
+function body(...parts: Array<string | null>): string {
+  return parts.filter((part): part is string => part !== null).join('\n\n')
+}
+
+function when(listing: ListingDigest): string {
+  return formatEventTime(listing.startsAt)
+}
+
+export function newListingEmail(ctx: TemplateContext, input: Base): EmailMessage {
+  const { listing, to } = input
+  return {
+    kind: 'new_listing',
+    entityId: listing.listingId,
+    to,
+    subject: `New table at ${title(listing)}`,
+    text: body(
+      `Hi ${to.name},`,
+      `${listing.hostName} listed a table at ${listing.venueName}${listing.eventName ? ` for ${listing.eventName}` : ''}.`,
+      `${when(listing)}\n${formatRupiah(listing.seatPrice)} per seat`,
+      `Ask for a seat: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function seatRequestedEmail(
+  ctx: TemplateContext,
+  input: Base & { requestId: string; guestName: string; message: string | null },
+): EmailMessage {
+  const { listing, to, guestName, message } = input
+  return {
+    kind: 'seat_requested',
+    entityId: input.requestId,
+    to,
+    subject: `${guestName} wants a seat at ${listing.venueName}`,
+    text: body(
+      `Hi ${to.name},`,
+      `${guestName} asked for a seat at your table — ${title(listing)}, ${when(listing)}.`,
+      message ? `They said:\n${message}` : null,
+      `Approve or decline: ${manageUrl(ctx, listing)}`,
+      `The table: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function seatApprovedEmail(ctx: TemplateContext, input: Base & { requestId: string }): EmailMessage {
+  const { listing, to } = input
+  return {
+    kind: 'seat_approved',
+    entityId: input.requestId,
+    to,
+    subject: `You're in at ${title(listing)}`,
+    text: body(
+      `Hi ${to.name},`,
+      `${listing.hostName} approved your seat at ${listing.venueName}.`,
+      `${when(listing)}\n${formatRupiah(listing.seatPrice)} to ${listing.hostName}`,
+      listing.paymentLink ? `Pay here: ${listing.paymentLink}` : null,
+      listing.paymentNote,
+      `Mark it paid once you have: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function seatDeclinedEmail(ctx: TemplateContext, input: Base & { requestId: string }): EmailMessage {
+  const { listing, to } = input
+  return {
+    kind: 'seat_declined',
+    entityId: input.requestId,
+    to,
+    subject: `No seat this time at ${listing.venueName}`,
+    text: body(
+      `Hi ${to.name},`,
+      `${listing.hostName} couldn't fit you in at ${title(listing)} on ${when(listing)}.`,
+      `Other tables: ${ctx.baseUrl}`,
+      `The table: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function seatRemovedEmail(ctx: TemplateContext, input: Base & { requestId: string }): EmailMessage {
+  const { listing, to } = input
+  return {
+    kind: 'seat_removed',
+    entityId: input.requestId,
+    to,
+    subject: `Your seat at ${listing.venueName} was released`,
+    text: body(
+      `Hi ${to.name},`,
+      `${listing.hostName} released your seat at ${title(listing)} on ${when(listing)}.`,
+      `If you already paid, ${listing.hostName} owes you a refund directly — this app never holds money.`,
+      `The table: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function listingCancelledEmail(ctx: TemplateContext, input: Base): EmailMessage {
+  const { listing, to } = input
+  return {
+    kind: 'listing_cancelled',
+    entityId: listing.listingId,
+    to,
+    subject: `Cancelled: ${title(listing)}`,
+    text: body(
+      `Hi ${to.name},`,
+      `${listing.hostName} cancelled the table at ${listing.venueName} on ${when(listing)}.`,
+      `If you already paid, ${listing.hostName} owes you a refund directly — this app never holds money.`,
+      `Other tables: ${ctx.baseUrl}`,
+      `The table: ${listingUrl(ctx, listing)}`,
+    ),
+  }
+}
+
+export function eventReminderEmail(
+  ctx: TemplateContext,
+  input: Base & { role: 'host' | 'guest'; outstanding: Rupiah; approvedSeats: number },
+): EmailMessage {
+  const { listing, to, role, outstanding, approvedSeats } = input
+
+  return {
+    kind: 'event_reminder',
+    entityId: listing.listingId,
+    to,
+    subject: `Tomorrow: ${title(listing)}`,
+    text: role === 'host'
+      ? body(
+        `Hi ${to.name},`,
+        `Your table at ${listing.venueName} is tomorrow — ${when(listing)}.`,
+        `${approvedSeats} ${approvedSeats === 1 ? 'guest is' : 'guests are'} coming.`,
+        outstanding > 0
+          ? `${formatRupiah(outstanding)} is still uncollected.`
+          : 'Everyone has paid — all settled.',
+        `The roster and payments: ${manageUrl(ctx, listing)}`,
+        `The table: ${listingUrl(ctx, listing)}`,
+      )
+      : body(
+        `Hi ${to.name},`,
+        `${title(listing)} is tomorrow — ${when(listing)}.`,
+        outstanding > 0
+          ? `You still owe ${formatRupiah(outstanding)} to ${listing.hostName}.`
+          : `You're all settled with ${listing.hostName}.`,
+        `The table: ${listingUrl(ctx, listing)}`,
+      ),
+  }
+}
+```
+
+Every body is plain text. HTML would need a second template per email and a second thing to keep in sync, for an audience that will read all of this on a phone lock screen anyway.
+
+- [ ] **Step 5: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add lib/domain/notify tests/domain/notify
+git commit -m "feat: add email templates for every state change"
+git push
+```
+
+---
+
+### Task 7: Idempotent dispatch
+
+**Files:**
+- Create: `lib/domain/notify/ports.ts`, `lib/domain/notify/dispatch.ts`
+- Create: `tests/support/fake-notify.ts`
+- Test: `tests/domain/notify/dispatch.test.ts`
+
+**Interfaces:**
+- Consumes: `EmailMessage`, `EmailKind` (Task 6).
+- Produces: `EmailSender`, `EmailLogRepository`, `RecipientRepository`, `NotifyDeps`; `dispatch(deps, messages): Promise<DispatchResult>`; `interface DispatchResult { sent, skipped, failed }`.
+
+- [ ] **Step 1: Define the ports**
+
+Create `lib/domain/notify/ports.ts`:
+
+```ts
+import type { EmailKind, EmailMessage, Recipient } from './types'
+
+export interface EmailSender {
+  send(message: EmailMessage): Promise<void>
+}
+
+export interface EmailLogRepository {
+  /**
+   * Insert an `email_log` row, returning false if one already exists.
+   *
+   * Backed by `unique(kind, entity_id, to_user_id)`. Claiming *before* sending
+   * is what makes two concurrent dispatches of the same event send once rather
+   * than twice — the loser sees false and skips.
+   */
+  claim(kind: EmailKind, entityId: string, toUserId: string, at: Date): Promise<boolean>
+
+  /** Undo a claim whose send then failed, so a later retry can take it again. */
+  release(kind: EmailKind, entityId: string, toUserId: string): Promise<void>
+}
+
+export interface RecipientRepository {
+  findRecipient(userId: string): Promise<Recipient | null>
+  findRecipients(userIds: string[]): Promise<Recipient[]>
+  /** Everyone who can currently sign in. Used only by the new-listing announcement. */
+  listActiveRecipients(): Promise<Recipient[]>
+}
+
+export interface NotifyDeps {
+  sender: EmailSender
+  log: EmailLogRepository
+  recipients: RecipientRepository
+  now: () => Date
+  baseUrl: string
+}
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `tests/domain/notify/dispatch.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { dispatch } from '@/lib/domain/notify/dispatch'
+import type { EmailMessage } from '@/lib/domain/notify/types'
+import { FakeEmailLog, FakeEmailSender, FakeRecipients } from '../../support/fake-notify'
+
+const NOW = new Date('2026-08-01T12:00:00Z')
+
+let sender: FakeEmailSender
+let log: FakeEmailLog
+let recipients: FakeRecipients
+
+const deps = () => ({ sender, log, recipients, now: () => NOW, baseUrl: 'https://wazup.party' })
+
+const message = (overrides: Partial<EmailMessage> = {}): EmailMessage => ({
+  kind: 'seat_approved',
+  entityId: 'request-1',
+  to: { userId: 'user-1', email: 'a@example.com', name: 'A' },
+  subject: 'You are in',
+  text: 'body',
+  ...overrides,
+})
+
+beforeEach(() => {
+  sender = new FakeEmailSender()
+  log = new FakeEmailLog()
+  recipients = new FakeRecipients()
+})
+
+describe('dispatch', () => {
+  it('sends a message and records that it went out', async () => {
+    const result = await dispatch(deps(), [message()])
+
+    expect(result).toMatchObject({ sent: 1, skipped: 0 })
+    expect(result.failed).toEqual([])
+    expect(sender.sent).toHaveLength(1)
+    expect(log.rows).toEqual([
+      { kind: 'seat_approved', entityId: 'request-1', toUserId: 'user-1', at: NOW },
+    ])
+  })
+
+  it('never sends the same email to the same person twice', async () => {
+    await dispatch(deps(), [message()])
+    const result = await dispatch(deps(), [message()])
+
+    expect(result).toMatchObject({ sent: 0, skipped: 1 })
+    expect(sender.sent).toHaveLength(1)
+  })
+
+  it('treats the same event to different people as different emails', async () => {
+    await dispatch(deps(), [
+      message({ to: { userId: 'user-1', email: 'a@example.com', name: 'A' } }),
+      message({ to: { userId: 'user-2', email: 'b@example.com', name: 'B' } }),
+    ])
+
+    expect(sender.sent).toHaveLength(2)
+  })
+
+  it('treats different events to the same person as different emails', async () => {
+    await dispatch(deps(), [
+      message({ kind: 'seat_approved', entityId: 'request-1' }),
+      message({ kind: 'seat_removed', entityId: 'request-1' }),
+      message({ kind: 'seat_approved', entityId: 'request-2' }),
+    ])
+
+    expect(sender.sent).toHaveLength(3)
+  })
+
+  it('releases the claim when a send fails, so a retry can take it', async () => {
+    sender.failOn = 'a@example.com'
+
+    const first = await dispatch(deps(), [message()])
+
+    expect(first.sent).toBe(0)
+    expect(first.failed).toHaveLength(1)
+    expect(first.failed[0].message.to.email).toBe('a@example.com')
+    expect(log.rows).toEqual([])
+
+    sender.failOn = null
+    const retry = await dispatch(deps(), [message()])
+
+    expect(retry.sent).toBe(1)
+  })
+
+  it('keeps going after one recipient fails', async () => {
+    sender.failOn = 'a@example.com'
+
+    const result = await dispatch(deps(), [
+      message({ to: { userId: 'user-1', email: 'a@example.com', name: 'A' } }),
+      message({ to: { userId: 'user-2', email: 'b@example.com', name: 'B' } }),
+    ])
+
+    expect(result.sent).toBe(1)
+    expect(result.failed).toHaveLength(1)
+    expect(sender.sent.map((m) => m.to.email)).toEqual(['b@example.com'])
+  })
+
+  it('does nothing, successfully, when given nothing', async () => {
+    const result = await dispatch(deps(), [])
+
+    expect(result).toMatchObject({ sent: 0, skipped: 0 })
+    expect(result.failed).toEqual([])
+  })
+
+  it('sends one at a time rather than flooding the provider', async () => {
+    await dispatch(deps(), Array.from({ length: 5 }, (_, i) =>
+      message({ to: { userId: `user-${i}`, email: `${i}@example.com`, name: `U${i}` } })))
+
+    expect(sender.maxConcurrent).toBe(1)
+    expect(sender.sent).toHaveLength(5)
+  })
+})
+```
+
+The last test pins a decision. Sends are sequential, not `Promise.all`. The largest fan-out in this product is "new table listed" to every active member, which for a curated community is tens of people; a burst of parallel requests buys nothing and is the fastest way to hit a provider rate limit and turn a partial success into a partial mystery.
+
+- [ ] **Step 3: Write the notify fakes**
+
+Create `tests/support/fake-notify.ts`:
+
+```ts
+import type {
+  EmailLogRepository, EmailSender, RecipientRepository,
+} from '@/lib/domain/notify/ports'
+import type { EmailKind, EmailMessage, Recipient } from '@/lib/domain/notify/types'
+
+export class FakeEmailSender implements EmailSender {
+  sent: EmailMessage[] = []
+  /** Set to an address to make sends to it throw. */
+  failOn: string | null = null
+
+  private inFlight = 0
+  maxConcurrent = 0
+
+  async send(message: EmailMessage): Promise<void> {
+    this.inFlight += 1
+    this.maxConcurrent = Math.max(this.maxConcurrent, this.inFlight)
+    try {
+      // Yield, so a caller using Promise.all would overlap and be caught.
+      await Promise.resolve()
+      if (this.failOn === message.to.email) throw new Error('provider is down')
+      this.sent.push(message)
+    } finally {
+      this.inFlight -= 1
+    }
+  }
+}
+
+interface LogRow {
+  kind: EmailKind
+  entityId: string
+  toUserId: string
+  at: Date
+}
+
+export class FakeEmailLog implements EmailLogRepository {
+  rows: LogRow[] = []
+
+  async claim(kind: EmailKind, entityId: string, toUserId: string, at: Date): Promise<boolean> {
+    const exists = this.rows.some(
+      (row) => row.kind === kind && row.entityId === entityId && row.toUserId === toUserId,
+    )
+    if (exists) return false
+    this.rows.push({ kind, entityId, toUserId, at })
+    return true
+  }
+
+  async release(kind: EmailKind, entityId: string, toUserId: string): Promise<void> {
+    this.rows = this.rows.filter(
+      (row) => !(row.kind === kind && row.entityId === entityId && row.toUserId === toUserId),
+    )
+  }
+}
+
+export class FakeRecipients implements RecipientRepository {
+  people: Recipient[] = []
+
+  seed(recipient: Recipient): Recipient {
+    this.people.push(recipient)
+    return recipient
+  }
+
+  async findRecipient(userId: string): Promise<Recipient | null> {
+    return this.people.find((person) => person.userId === userId) ?? null
+  }
+
+  async findRecipients(userIds: string[]): Promise<Recipient[]> {
+    return this.people.filter((person) => userIds.includes(person.userId))
+  }
+
+  async listActiveRecipients(): Promise<Recipient[]> {
+    return [...this.people]
+  }
+}
+```
+
+- [ ] **Step 4: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/notify/dispatch`.
+
+- [ ] **Step 5: Implement**
+
+Create `lib/domain/notify/dispatch.ts`:
+
+```ts
+import type { NotifyDeps } from './ports'
+import type { EmailMessage } from './types'
+
+export interface DispatchFailure {
+  message: EmailMessage
+  error: unknown
+}
+
+export interface DispatchResult {
+  sent: number
+  /** Already sent to this person for this event. Not an error. */
+  skipped: number
+  failed: DispatchFailure[]
+}
+
+/**
+ * Send a batch of emails, at most once each per recipient, ever.
+ *
+ * Claim first, then send, then release the claim if the send threw. This
+ * ordering is chosen against the alternative — send first, log after — which
+ * cannot stop two concurrent dispatches of the same event from both sending.
+ *
+ * The cost is a crash landing exactly between claim and send, which loses that
+ * one email permanently. v1 accepts that: there is no queue, the window is
+ * milliseconds, and the day-before reminder re-states everything that matters
+ * anyway. Never throws — a mail failure must not unwind whatever already
+ * committed to the database.
+ */
+export async function dispatch(deps: NotifyDeps, messages: EmailMessage[]): Promise<DispatchResult> {
+  const result: DispatchResult = { sent: 0, skipped: 0, failed: [] }
+
+  // Sequential on purpose. See the concurrency test in dispatch.test.ts.
+  for (const message of messages) {
+    const claimed = await deps.log.claim(message.kind, message.entityId, message.to.userId, deps.now())
+    if (!claimed) {
+      result.skipped += 1
+      continue
+    }
+
+    try {
+      await deps.sender.send(message)
+      result.sent += 1
+    } catch (error) {
+      await deps.log.release(message.kind, message.entityId, message.to.userId).catch(() => {
+        // If the release itself fails there is nothing further to try, and the
+        // only consequence is one email that will not be retried.
+      })
+      result.failed.push({ message, error })
+    }
+  }
+
+  return result
+}
+```
+
+- [ ] **Step 6: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+- [ ] **Step 7: Commit and push**
+
+```bash
+git add lib/domain/notify tests/domain/notify tests/support/fake-notify.ts
+git commit -m "feat: add idempotent email dispatch with claim-before-send"
+git push
+```
+
+---
