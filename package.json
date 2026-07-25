@@ -12,7 +12,8 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "dev:session": "tsx --tsconfig tsconfig.json scripts/dev-session.ts"
+    "dev:session": "tsx --tsconfig tsconfig.json scripts/dev-session.ts",
+    "db:seed": "tsx --tsconfig tsconfig.json scripts/seed.ts"
   },
   "engines": {
     "node": ">=20"
