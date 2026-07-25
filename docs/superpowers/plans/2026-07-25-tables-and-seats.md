@@ -3606,3 +3606,559 @@ git push
 ```
 
 ---
+
+### Task 10: Wiring, navigation, and the feed
+
+The first screen of this plan. From here the tasks are adapters: authenticate, call a domain function, render.
+
+**Files:**
+- Create: `lib/tables-service.ts`, `lib/seats-service.ts`, `lib/session.ts`
+- Create: `app/nav.tsx`, `app/listing-card.tsx`
+- Modify: `app/layout.tsx`, `app/page.tsx`
+
+**Interfaces:**
+- Consumes: every domain module so far; `auth`, `signOut` (Plan 1 Task 7).
+- Produces: `tablesDeps`, `seatsDeps`, the single wired `TablesDeps`/`SeatsDeps` every adapter uses; `requireUserId(): Promise<string>`; `<Nav />`; `<ListingCard summary now />`.
+
+- [ ] **Step 1: Wire the domain to the database**
+
+Create `lib/tables-service.ts`:
+
+```ts
+import { db } from '@/lib/db/client'
+import { PostgresTablesRepository } from '@/lib/db/repositories/tables'
+import type { TablesDeps } from '@/lib/domain/tables/ports'
+
+export const tablesDeps: TablesDeps = {
+  repository: new PostgresTablesRepository(db),
+  now: () => new Date(),
+}
+```
+
+Create `lib/seats-service.ts`:
+
+```ts
+import { db } from '@/lib/db/client'
+import { PostgresSeatsRepository } from '@/lib/db/repositories/seats'
+import type { SeatsDeps } from '@/lib/domain/seats/ports'
+
+export const seatsDeps: SeatsDeps = {
+  repository: new PostgresSeatsRepository(db),
+  now: () => new Date(),
+}
+```
+
+These two files and `lib/membership-service.ts` are the only places the domain meets the database.
+
+- [ ] **Step 2: Add the session guard**
+
+Plan 1 repeated the guard inline because there were four routes. This plan adds seven more, so it becomes a function.
+
+Create `lib/session.ts`:
+
+```ts
+import { redirect } from 'next/navigation'
+import { auth } from '@/lib/auth'
+
+/**
+ * The route guard, used by pages and server actions alike.
+ *
+ * Deliberately not middleware. `auth()` here is bound to a Drizzle adapter over
+ * postgres.js, which opens TCP sockets and cannot run in the Edge runtime that
+ * Next.js middleware uses. See Plan 1 Task 7 Step 2.
+ */
+export async function requireUserId(): Promise<string> {
+  const session = await auth()
+  if (!session?.user?.id) redirect('/login')
+  return session.user.id
+}
+```
+
+- [ ] **Step 3: Build the navigation**
+
+Create `app/nav.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { auth, signOut } from '@/lib/auth'
+
+const linkClass = 'text-sm text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-neutral-50'
+
+export async function Nav() {
+  const session = await auth()
+  if (!session?.user?.id) return null
+
+  return (
+    <header className="border-b border-neutral-200 dark:border-neutral-800">
+      <nav className="mx-auto flex max-w-lg items-center gap-4 px-6 py-3">
+        <Link href="/" className="mr-auto font-semibold">Party</Link>
+        <Link href="/tables/new" className={linkClass}>List a table</Link>
+        <Link href="/me" className={linkClass}>Me</Link>
+        <Link href="/invites" className={linkClass}>Invites</Link>
+        <form
+          action={async () => {
+            'use server'
+            await signOut({ redirectTo: '/login' })
+          }}
+        >
+          <button type="submit" className={linkClass}>Sign out</button>
+        </form>
+      </nav>
+    </header>
+  )
+}
+```
+
+- [ ] **Step 4: Mount the navigation in the layout**
+
+In `app/layout.tsx`, import `Nav` and render it immediately inside `<body>`, before `{children}`:
+
+```tsx
+import { Nav } from './nav'
+```
+
+```tsx
+      <body className={...}>
+        <Nav />
+        {children}
+      </body>
+```
+
+`Nav` renders nothing when signed out, so `/login` and `/join` are unaffected.
+
+- [ ] **Step 5: Build the listing card**
+
+Create `app/listing-card.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { formatEventTime } from '@/lib/domain/event-time'
+import { formatRupiah } from '@/lib/domain/money'
+import { deriveSummaryState } from '@/lib/domain/tables/derive'
+import type { ListingSummary } from '@/lib/domain/tables/types'
+
+export function ListingCard({ summary, now }: { summary: ListingSummary; now: Date }) {
+  const { listing, venue, host } = summary
+  const state = deriveSummaryState(summary, now)
+
+  const badge = state.isCancelled
+    ? { text: 'Cancelled', tone: 'bg-neutral-200 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400' }
+    : state.isPast
+      ? { text: 'Past', tone: 'bg-neutral-200 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400' }
+      : state.isFull
+        ? { text: 'Full', tone: 'bg-neutral-900 text-white dark:bg-white dark:text-neutral-900' }
+        : { text: `${state.spotsLeft} left`, tone: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' }
+
+  return (
+    <Link
+      href={`/tables/${listing.id}`}
+      className="block rounded-xl border border-neutral-200 p-4 active:bg-neutral-50 dark:border-neutral-800 dark:active:bg-neutral-900"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate font-medium">{venue.name}</p>
+          {listing.eventName && (
+            <p className="truncate text-sm text-neutral-500">{listing.eventName}</p>
+          )}
+        </div>
+        <span className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-medium ${badge.tone}`}>
+          {badge.text}
+        </span>
+      </div>
+
+      <p className="mt-3 text-sm">{formatEventTime(listing.startsAt)}</p>
+      <p className="mt-1 text-sm text-neutral-500">
+        {formatRupiah(listing.seatPrice)} per seat · hosted by {host.name}
+      </p>
+    </Link>
+  )
+}
+```
+
+Every time on every screen goes through `formatEventTime`, which pins the zone to Bali. A raw `toLocaleString()` anywhere would render the server's timezone instead.
+
+- [ ] **Step 6: Build the feed**
+
+Replace `app/page.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { isDomainError } from '@/lib/domain/errors'
+import { listFeed } from '@/lib/domain/tables/list-feed'
+import type { ListingSummary } from '@/lib/domain/tables/types'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+import { ListingCard } from './listing-card'
+
+const fieldClass =
+  'rounded-lg border border-neutral-300 px-3 py-2 text-base dark:border-neutral-700 dark:bg-neutral-950'
+
+export default async function FeedPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ venue?: string; from?: string; to?: string }>
+}) {
+  await requireUserId()
+  const { venue, from, to } = await searchParams
+
+  const venues = await tablesDeps.repository.listVenues()
+
+  let feed: ListingSummary[] = []
+  let error: string | null = null
+  try {
+    feed = await listFeed(tablesDeps, { venueId: venue, fromDay: from, toDay: to })
+  } catch (caught) {
+    if (!isDomainError(caught)) throw caught
+    error = caught.message
+  }
+
+  const now = new Date()
+
+  return (
+    <main className="mx-auto max-w-lg px-6 py-8">
+      <div className="flex items-baseline justify-between gap-3">
+        <h1 className="text-2xl font-semibold">Tables</h1>
+        <Link href="/tables/new" className="text-sm underline">List one</Link>
+      </div>
+
+      {/* A plain GET form: filters survive a refresh, are shareable as a URL,
+          and need no client JavaScript. */}
+      <form className="mt-4 flex flex-wrap gap-2" method="get">
+        <select name="venue" defaultValue={venue ?? ''} className={fieldClass}>
+          <option value="">Any venue</option>
+          {venues.map((v) => (
+            <option key={v.id} value={v.id}>{v.name}</option>
+          ))}
+        </select>
+        <input type="date" name="from" defaultValue={from ?? ''} className={fieldClass} aria-label="From" />
+        <input type="date" name="to" defaultValue={to ?? ''} className={fieldClass} aria-label="To" />
+        <button type="submit" className={`${fieldClass} font-medium`}>Filter</button>
+      </form>
+
+      {error && (
+        <p role="alert" className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+          {error}
+        </p>
+      )}
+
+      <ul className="mt-6 flex flex-col gap-3">
+        {feed.map((summary) => (
+          <li key={summary.listing.id}>
+            <ListingCard summary={summary} now={now} />
+          </li>
+        ))}
+      </ul>
+
+      {feed.length === 0 && !error && (
+        <div className="mt-6 rounded-xl bg-neutral-100 p-6 text-center dark:bg-neutral-900">
+          <p className="text-sm text-neutral-600 dark:text-neutral-400">
+            No tables coming up.
+          </p>
+          <Link href="/tables/new" className="mt-2 inline-block text-sm underline">
+            List the first one
+          </Link>
+        </div>
+      )}
+    </main>
+  )
+}
+```
+
+- [ ] **Step 7: Verify manually**
+
+```bash
+docker compose up -d
+npm run dev
+```
+
+Sign in as the seeded founder (use the token escape hatch from Plan 1 Task 7 Step 5). Expect the nav bar, an empty feed with the "list the first one" prompt, and a venue dropdown holding Savaya and Miss Fish.
+
+Insert a listing directly so the feed has something in it:
+
+```bash
+docker compose exec -T db psql -U party -d party -c "
+  insert into table_listings (host_id, venue_id, starts_at, seats_offered, seat_price)
+  select u.id, v.id, now() + interval '10 days', 4, 2500000
+  from users u, venues v where v.name = 'Savaya' limit 1"
+```
+
+Expect one card showing "Savaya", the Bali-time start, "Rp 2.500.000 per seat", and a green "4 left" badge.
+
+- [ ] **Step 8: Confirm the production build passes**
+
+```bash
+npm run build
+```
+
+Expected: success.
+
+- [ ] **Step 9: Commit and push**
+
+```bash
+git add lib/tables-service.ts lib/seats-service.ts lib/session.ts app/nav.tsx app/listing-card.tsx app/layout.tsx app/page.tsx
+git commit -m "feat: add the tables feed with venue and date filters"
+git push
+```
+
+---
+
+### Task 11: Listing a table
+
+**Files:**
+- Create: `app/tables/new/page.tsx`, `app/tables/new/form.tsx`, `app/tables/new/actions.ts`
+
+**Interfaces:**
+- Consumes: `createListing` (Task 4), `findOrCreateVenue` (Task 1), `parseBaliDateTime` (Task 2), `parseRupiah` (Plan 1 Task 2), `tablesDeps` and `requireUserId` (Task 10).
+- Produces: `createListingAction(prev, formData)`; `interface NewListingState { error?: string }`.
+
+- [ ] **Step 1: Write the server action**
+
+Create `app/tables/new/actions.ts`:
+
+```ts
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { isDomainError } from '@/lib/domain/errors'
+import { parseBaliDateTime } from '@/lib/domain/event-time'
+import { parseRupiah } from '@/lib/domain/money'
+import { createListing } from '@/lib/domain/tables/create-listing'
+import { findOrCreateVenue } from '@/lib/domain/tables/venues'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+
+export interface NewListingState {
+  error?: string
+}
+
+/** The sentinel the venue select uses for "somewhere not on the list". */
+export const NEW_VENUE = '__new__'
+
+function text(formData: FormData, key: string): string {
+  return String(formData.get(key) ?? '')
+}
+
+function optionalText(formData: FormData, key: string): string | null {
+  const value = text(formData, key).trim()
+  return value.length > 0 ? value : null
+}
+
+async function resolveVenueId(formData: FormData, userId: string): Promise<string> {
+  const chosen = text(formData, 'venueId')
+  if (chosen !== NEW_VENUE) return chosen
+
+  const venue = await findOrCreateVenue(tablesDeps, {
+    name: text(formData, 'venueName'),
+    city: text(formData, 'venueCity'),
+    createdBy: userId,
+  })
+  return venue.id
+}
+
+export async function createListingAction(
+  _prev: NewListingState,
+  formData: FormData,
+): Promise<NewListingState> {
+  const userId = await requireUserId()
+
+  let listingId: string
+  try {
+    const venueId = await resolveVenueId(formData, userId)
+    const tableTotalRaw = optionalText(formData, 'tableTotal')
+
+    const listing = await createListing(tablesDeps, {
+      hostId: userId,
+      venueId,
+      eventName: optionalText(formData, 'eventName'),
+      startsAt: parseBaliDateTime(text(formData, 'startsAt')),
+      // An empty seat count becomes 0, which createListing rejects with a
+      // sentence about offering between 1 and 20 seats. That is the message we
+      // want, so no separate check is needed here.
+      seatsOffered: Number(text(formData, 'seatsOffered')),
+      seatPrice: parseRupiah(text(formData, 'seatPrice')),
+      tableTotal: tableTotalRaw === null ? null : parseRupiah(tableTotalRaw),
+      notes: optionalText(formData, 'notes'),
+      paymentLink: optionalText(formData, 'paymentLink'),
+      paymentNote: optionalText(formData, 'paymentNote'),
+    })
+    listingId = listing.id
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidatePath('/')
+  // Outside the try: redirect signals by throwing, and catching that would show
+  // the host a failure after their table was successfully created.
+  redirect(`/tables/${listingId}`)
+}
+```
+
+- [ ] **Step 2: Build the form**
+
+Create `app/tables/new/form.tsx`:
+
+```tsx
+'use client'
+
+import { useActionState, useState } from 'react'
+import type { Venue } from '@/lib/domain/tables/types'
+import { NEW_VENUE, createListingAction, type NewListingState } from './actions'
+
+const inputClass =
+  'w-full rounded-lg border border-neutral-300 px-4 py-3 text-base dark:border-neutral-700 dark:bg-neutral-950'
+const labelClass = 'text-sm font-medium'
+
+export function NewListingForm({ venues }: { venues: Venue[] }) {
+  const [state, formAction, pending] = useActionState<NewListingState, FormData>(createListingAction, {})
+  const [venueId, setVenueId] = useState(venues[0]?.id ?? NEW_VENUE)
+
+  return (
+    <form action={formAction} className="mt-6 flex flex-col gap-4">
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Venue</span>
+        <select
+          name="venueId" value={venueId} onChange={(event) => setVenueId(event.target.value)}
+          className={inputClass}
+        >
+          {venues.map((venue) => (
+            <option key={venue.id} value={venue.id}>{venue.name}</option>
+          ))}
+          <option value={NEW_VENUE}>Somewhere else…</option>
+        </select>
+      </label>
+
+      {venueId === NEW_VENUE && (
+        <div className="flex gap-2">
+          <input name="venueName" placeholder="Venue name" className={inputClass} />
+          <input name="venueCity" defaultValue="Bali" placeholder="City" className={inputClass} />
+        </div>
+      )}
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Starts</span>
+        <input type="datetime-local" name="startsAt" required className={inputClass} />
+        <span className="text-xs text-neutral-500">Bali time (WITA).</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Seats for guests</span>
+        <input
+          type="number" name="seatsOffered" required min={1} max={20} defaultValue={4}
+          inputMode="numeric" className={inputClass}
+        />
+        <span className="text-xs text-neutral-500">Your own place is not one of these.</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Price per seat</span>
+        <input
+          name="seatPrice" required inputMode="numeric" placeholder="2.500.000" className={inputClass}
+        />
+        <span className="text-xs text-neutral-500">Rupiah. Everyone pays the same.</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Event name (optional)</span>
+        <input name="eventName" placeholder="Peggy Gou" className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Table total (optional)</span>
+        <input name="tableTotal" inputMode="numeric" placeholder="25.000.000" className={inputClass} />
+        <span className="text-xs text-neutral-500">Shown on the listing so people can see your math. Nothing is calculated from it.</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Payment link (optional)</span>
+        <input name="paymentLink" inputMode="url" placeholder="https://…" className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>How to pay (optional)</span>
+        <input name="paymentNote" placeholder="GoPay to 0812…" className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Notes (optional)</span>
+        <textarea name="notes" rows={3} placeholder="Table 12, arrive before midnight" className={inputClass} />
+      </label>
+
+      {state.error && (
+        <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+          {state.error}
+        </p>
+      )}
+
+      <button
+        type="submit" disabled={pending}
+        className="rounded-lg bg-neutral-900 px-4 py-3 text-base font-medium text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+      >
+        {pending ? 'Listing…' : 'List the table'}
+      </button>
+    </form>
+  )
+}
+```
+
+Every input is `text-base`, which is 16px. Below that, iOS Safari zooms the viewport on focus — disorienting on a phone at 1am, which is exactly when this form gets used.
+
+- [ ] **Step 3: Build the page**
+
+Create `app/tables/new/page.tsx`:
+
+```tsx
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+import { NewListingForm } from './form'
+
+export default async function NewListingPage() {
+  await requireUserId()
+  const venues = await tablesDeps.repository.listVenues()
+
+  return (
+    <main className="mx-auto max-w-lg px-6 py-8">
+      <h1 className="text-2xl font-semibold">List a table</h1>
+      <p className="mt-2 text-sm text-neutral-500">
+        You&apos;ve booked it. Offer the spare seats at a fixed price and approve who joins.
+      </p>
+
+      <NewListingForm venues={venues} />
+    </main>
+  )
+}
+```
+
+- [ ] **Step 4: Verify manually, including the timezone**
+
+```bash
+npm run dev
+```
+
+List a table at Savaya starting at 22:00 on a date ten days out. Expect a redirect to the detail page (404 until Task 12 — that is fine), and:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select starts_at, starts_at at time zone 'Asia/Makassar' as bali, seat_price from table_listings order by created_at desc limit 1"
+```
+
+Expected: the `bali` column reads 22:00 on the date you chose. If it reads 22:00 in the `starts_at` column instead, `parseBaliDateTime` is being bypassed somewhere.
+
+Then try the failure paths: a price of `abc`, zero seats, a `paymentLink` of `ftp://x`, and a start time in the past. Each should re-render the form with a specific sentence, not a stack trace.
+
+- [ ] **Step 5: Confirm the production build passes**
+
+```bash
+npm run build
+```
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add app/tables/new
+git commit -m "feat: add the list-a-table screen"
+git push
+```
+
+---
