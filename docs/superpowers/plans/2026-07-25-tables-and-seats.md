@@ -1195,3 +1195,669 @@ git commit -m "feat: derive listing state and add the feed query"
 ```
 
 ---
+
+### Task 4: Creating a listing
+
+**Files:**
+- Modify: `lib/domain/money.ts` (export one existing function)
+- Create: `lib/domain/tables/create-listing.ts`
+- Test: `tests/domain/tables/create-listing.test.ts`
+
+**Interfaces:**
+- Consumes: `TablesDeps`, `TableListing` (Task 1); `assertWholeRupiah` (this task); `DomainError`.
+- Produces: `createListing(deps, input): Promise<TableListing>`; `MAX_SEATS_OFFERED = 20`; `MAX_EVENT_NAME_LENGTH = 80`; `MAX_NOTES_LENGTH = 500`; `MAX_PAYMENT_NOTE_LENGTH = 200`; `interface CreateListingInput`.
+
+- [ ] **Step 1: Export the rupiah assertion**
+
+`lib/domain/money.ts` keeps `assertWholeRupiah` private. Listing validation needs it. Change one word:
+
+```ts
+export function assertWholeRupiah(amount: number): void {
+```
+
+Its behaviour is already covered by the money tests from Plan 1 Task 2, so this needs no new test of its own.
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `tests/domain/tables/create-listing.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { MAX_SEATS_OFFERED, createListing } from '@/lib/domain/tables/create-listing'
+import { DomainError } from '@/lib/domain/errors'
+import { FakePartyRepository } from '../../support/fake-party-repository'
+
+const NOW = new Date('2026-08-01T12:00:00Z')
+const LATER = new Date('2026-09-01T14:00:00Z')
+
+let repository: FakePartyRepository
+let hostId: string
+let venueId: string
+
+const deps = () => ({ repository, now: () => NOW })
+
+const input = (overrides: Record<string, unknown> = {}) => ({
+  hostId,
+  venueId,
+  eventName: null,
+  startsAt: LATER,
+  seatsOffered: 4,
+  seatPrice: 2_500_000,
+  tableTotal: null,
+  notes: null,
+  paymentLink: null,
+  paymentNote: null,
+  ...overrides,
+}) as Parameters<typeof createListing>[1]
+
+beforeEach(() => {
+  repository = new FakePartyRepository()
+  hostId = repository.seedUser({ name: 'Host' }).id
+  venueId = repository.seedVenue({ name: 'Savaya', city: 'Bali' }).id
+})
+
+describe('createListing', () => {
+  it('creates an open listing owned by the host', async () => {
+    const listing = await createListing(deps(), input())
+
+    expect(listing.hostId).toBe(hostId)
+    expect(listing.venueId).toBe(venueId)
+    expect(listing.seatsOffered).toBe(4)
+    expect(listing.seatPrice).toBe(2_500_000)
+    expect(listing.status).toBe('open')
+    expect(listing.cancelledAt).toBeNull()
+  })
+
+  it('trims optional text and stores blanks as null', async () => {
+    const listing = await createListing(deps(), input({
+      eventName: '  Peggy Gou  ', notes: '   ', paymentNote: '  GoPay  ',
+    }))
+
+    expect(listing.eventName).toBe('Peggy Gou')
+    expect(listing.notes).toBeNull()
+    expect(listing.paymentNote).toBe('GoPay')
+  })
+
+  it('accepts an optional table total the host wants to show publicly', async () => {
+    const listing = await createListing(deps(), input({ tableTotal: 25_000_000 }))
+
+    expect(listing.tableTotal).toBe(25_000_000)
+  })
+
+  it('rejects a venue that does not exist', async () => {
+    await expect(createListing(deps(), input({ venueId: 'nope' })))
+      .rejects.toMatchObject({ code: 'venue_not_found' })
+  })
+
+  it('rejects a start time in the past', async () => {
+    await expect(createListing(deps(), input({ startsAt: new Date('2026-07-01T14:00:00Z') })))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
+  it('rejects a start time of exactly now', async () => {
+    await expect(createListing(deps(), input({ startsAt: NOW })))
+      .rejects.toBeInstanceOf(DomainError)
+  })
+
+  it('rejects a seat count that is not a sensible number of guests', async () => {
+    for (const seatsOffered of [0, -1, 1.5, MAX_SEATS_OFFERED + 1]) {
+      await expect(
+        createListing(deps(), input({ seatsOffered })),
+        `expected ${seatsOffered} seats to be rejected`,
+      ).rejects.toMatchObject({ code: 'invalid_input' })
+    }
+  })
+
+  it('allows a single seat, which is the common case for one spare spot', async () => {
+    const listing = await createListing(deps(), input({ seatsOffered: 1 }))
+
+    expect(listing.seatsOffered).toBe(1)
+  })
+
+  it('allows a free seat but rejects a negative one', async () => {
+    expect((await createListing(deps(), input({ seatPrice: 0 }))).seatPrice).toBe(0)
+
+    await expect(createListing(deps(), input({ seatPrice: -1 })))
+      .rejects.toMatchObject({ code: 'invalid_amount' })
+  })
+
+  it('rejects a fractional seat price rather than rounding it', async () => {
+    await expect(createListing(deps(), input({ seatPrice: 2_500_000.5 })))
+      .rejects.toMatchObject({ code: 'invalid_amount' })
+  })
+
+  it('accepts an http or https payment link and rejects anything else', async () => {
+    const ok = await createListing(deps(), input({ paymentLink: ' https://gopay.example/abc ' }))
+    expect(ok.paymentLink).toBe('https://gopay.example/abc')
+
+    for (const bad of ['gopay.example/abc', 'javascript:alert(1)', 'mailto:me@example.com']) {
+      await expect(
+        createListing(deps(), input({ paymentLink: bad })),
+        `expected ${JSON.stringify(bad)} to be rejected`,
+      ).rejects.toMatchObject({ code: 'invalid_input' })
+    }
+  })
+
+  it('rejects text fields longer than their limits', async () => {
+    await expect(createListing(deps(), input({ eventName: 'x'.repeat(81) })))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+    await expect(createListing(deps(), input({ notes: 'x'.repeat(501) })))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+    await expect(createListing(deps(), input({ paymentNote: 'x'.repeat(201) })))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+})
+```
+
+Rejecting `javascript:` is not theoretical. The payment link is rendered as an anchor on the listing page, and any host can set it — a curated community is not a trusted one when one member's account is compromised.
+
+- [ ] **Step 3: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/tables/create-listing`.
+
+- [ ] **Step 4: Implement**
+
+Create `lib/domain/tables/create-listing.ts`:
+
+```ts
+import { DomainError } from '../errors'
+import { assertWholeRupiah, type Rupiah } from '../money'
+import type { TablesDeps } from './ports'
+import type { TableListing } from './types'
+
+/** A club table seats a party, not a wedding. The cap catches typos, not ambition. */
+export const MAX_SEATS_OFFERED = 20
+export const MAX_EVENT_NAME_LENGTH = 80
+export const MAX_NOTES_LENGTH = 500
+export const MAX_PAYMENT_NOTE_LENGTH = 200
+
+export interface CreateListingInput {
+  hostId: string
+  venueId: string
+  eventName: string | null
+  startsAt: Date
+  seatsOffered: number
+  seatPrice: Rupiah
+  tableTotal: Rupiah | null
+  notes: string | null
+  paymentLink: string | null
+  paymentNote: string | null
+}
+
+export function cleanText(value: string | null, max: number, label: string): string | null {
+  const trimmed = (value ?? '').trim()
+  if (trimmed.length === 0) return null
+  if (trimmed.length > max) {
+    throw new DomainError('invalid_input', `${label} is at most ${max} characters.`)
+  }
+  return trimmed
+}
+
+export function cleanPaymentLink(value: string | null): string | null {
+  const trimmed = (value ?? '').trim()
+  if (trimmed.length === 0) return null
+
+  // Anchored, not a substring match: "javascript:alert(1)#https://x" must fail.
+  if (!/^https?:\/\/\S+$/i.test(trimmed)) {
+    throw new DomainError('invalid_input', 'A payment link has to start with http:// or https://.')
+  }
+  return trimmed
+}
+
+export function assertSeatPrice(seatPrice: Rupiah): void {
+  if (seatPrice < 0) {
+    throw new DomainError('invalid_amount', 'A seat price cannot be negative.')
+  }
+  assertWholeRupiah(seatPrice)
+}
+
+export function assertSeatsOffered(seatsOffered: number): void {
+  if (!Number.isInteger(seatsOffered) || seatsOffered < 1 || seatsOffered > MAX_SEATS_OFFERED) {
+    throw new DomainError(
+      'invalid_input',
+      `Offer between 1 and ${MAX_SEATS_OFFERED} seats.`,
+      { seatsOffered },
+    )
+  }
+}
+
+export async function createListing(deps: TablesDeps, input: CreateListingInput): Promise<TableListing> {
+  const venue = await deps.repository.findVenueById(input.venueId)
+  if (!venue) {
+    throw new DomainError('venue_not_found', 'Pick a venue, or add a new one.')
+  }
+
+  if (input.startsAt.getTime() <= deps.now().getTime()) {
+    throw new DomainError('invalid_input', 'A table has to start in the future.')
+  }
+
+  assertSeatsOffered(input.seatsOffered)
+  assertSeatPrice(input.seatPrice)
+
+  if (input.tableTotal !== null) {
+    assertSeatPrice(input.tableTotal)
+  }
+
+  return deps.repository.insertListing({
+    hostId: input.hostId,
+    venueId: input.venueId,
+    // `seats_offered` counts guest seats only — never the host's own place. The
+    // host's cost is not modelled at all, because a fixed seat price means no
+    // calculation ever needs it.
+    seatsOffered: input.seatsOffered,
+    seatPrice: input.seatPrice,
+    // Display-only. Participates in no calculation; it exists so a host can show
+    // their math, which has social value in a curated community and no other.
+    tableTotal: input.tableTotal,
+    startsAt: input.startsAt,
+    eventName: cleanText(input.eventName, MAX_EVENT_NAME_LENGTH, 'The event name'),
+    notes: cleanText(input.notes, MAX_NOTES_LENGTH, 'Notes'),
+    paymentNote: cleanText(input.paymentNote, MAX_PAYMENT_NOTE_LENGTH, 'The payment note'),
+    paymentLink: cleanPaymentLink(input.paymentLink),
+  })
+}
+```
+
+- [ ] **Step 5: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+Expected: all create-listing tests pass and lint is clean.
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add lib/domain/money.ts lib/domain/tables/create-listing.ts tests/domain/tables/create-listing.test.ts
+git commit -m "feat: add listing creation with validation"
+git push
+```
+
+---
+
+### Task 5: Editing and cancelling a listing
+
+The two host mutations that operate on a listing that already exists. They share every guard, which is why they share a file.
+
+**Files:**
+- Create: `lib/domain/tables/manage-listing.ts`
+- Test: `tests/domain/tables/manage-listing.test.ts`
+
+**Interfaces:**
+- Consumes: `TablesDeps`, `ListingPatch`, `CancelCascade` (Task 1); `deriveListingState` (Task 3); validators from Task 4.
+- Produces: `editListing(deps, input): Promise<TableListing>`; `cancelListing(deps, input): Promise<CancelCascade>`; `interface EditListingInput`; `interface CancelListingInput`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/domain/tables/manage-listing.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { cancelListing, editListing } from '@/lib/domain/tables/manage-listing'
+import { DomainError } from '@/lib/domain/errors'
+import { FakePartyRepository } from '../../support/fake-party-repository'
+
+const NOW = new Date('2026-08-01T12:00:00Z')
+const LATER = new Date('2026-09-01T14:00:00Z')
+
+let repository: FakePartyRepository
+let hostId: string
+let strangerId: string
+let guestId: string
+
+const deps = () => ({ repository, now: () => NOW })
+
+beforeEach(() => {
+  repository = new FakePartyRepository()
+  hostId = repository.seedUser({ name: 'Host' }).id
+  strangerId = repository.seedUser({ name: 'Stranger' }).id
+  guestId = repository.seedUser({ name: 'Guest' }).id
+})
+
+const openListing = () => repository.seedListing({ hostId, startsAt: LATER, seatsOffered: 4, seatPrice: 2_500_000 })
+
+describe('editListing', () => {
+  it('lets the host change the soft fields at any time', async () => {
+    const listing = openListing()
+
+    const updated = await editListing(deps(), {
+      listingId: listing.id,
+      hostId,
+      patch: { eventName: '  Peggy Gou  ', notes: 'Bring ID', paymentNote: 'GoPay', paymentLink: 'https://pay.example/x' },
+    })
+
+    expect(updated.eventName).toBe('Peggy Gou')
+    expect(updated.notes).toBe('Bring ID')
+    expect(updated.paymentNote).toBe('GoPay')
+    expect(updated.paymentLink).toBe('https://pay.example/x')
+  })
+
+  it('clears an optional field when the host blanks it', async () => {
+    const listing = repository.seedListing({ hostId, startsAt: LATER, notes: 'Old' })
+
+    const updated = await editListing(deps(), { listingId: listing.id, hostId, patch: { notes: '   ' } })
+
+    expect(updated.notes).toBeNull()
+  })
+
+  it('lets the host raise the seat count and change price and time while nobody is approved', async () => {
+    const listing = openListing()
+
+    const updated = await editListing(deps(), {
+      listingId: listing.id,
+      hostId,
+      patch: { seatsOffered: 8, seatPrice: 3_000_000, startsAt: new Date('2026-09-02T14:00:00Z') },
+    })
+
+    expect(updated.seatsOffered).toBe(8)
+    expect(updated.seatPrice).toBe(3_000_000)
+    expect(updated.startsAt).toEqual(new Date('2026-09-02T14:00:00Z'))
+  })
+
+  it('freezes the seat price once someone has been approved', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(editListing(deps(), { listingId: listing.id, hostId, patch: { seatPrice: 3_000_000 } }))
+      .rejects.toMatchObject({ code: 'listing_locked' })
+  })
+
+  it('freezes the start time once someone has been approved', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(editListing(deps(), {
+      listingId: listing.id, hostId, patch: { startsAt: new Date('2026-09-05T14:00:00Z') },
+    })).rejects.toMatchObject({ code: 'listing_locked' })
+  })
+
+  it('accepts a resubmitted form that repeats the frozen values unchanged', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    const updated = await editListing(deps(), {
+      listingId: listing.id,
+      hostId,
+      patch: { seatPrice: 2_500_000, startsAt: LATER, notes: 'Table 12' },
+    })
+
+    expect(updated.notes).toBe('Table 12')
+  })
+
+  it('lets the host still raise seats after an approval', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    const updated = await editListing(deps(), { listingId: listing.id, hostId, patch: { seatsOffered: 6 } })
+
+    expect(updated.seatsOffered).toBe(6)
+  })
+
+  it('refuses to lower seats below the number already approved', async () => {
+    const listing = openListing()
+    for (let i = 0; i < 3; i++) {
+      repository.seedRequest({ tableId: listing.id, userId: repository.seedUser({ name: `G${i}` }).id, status: 'approved' })
+    }
+
+    await expect(editListing(deps(), { listingId: listing.id, hostId, patch: { seatsOffered: 2 } }))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
+  it('allows lowering seats down to exactly the approved count', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    const updated = await editListing(deps(), { listingId: listing.id, hostId, patch: { seatsOffered: 1 } })
+
+    expect(updated.seatsOffered).toBe(1)
+  })
+
+  it('refuses anyone who is not the host', async () => {
+    const listing = openListing()
+
+    await expect(editListing(deps(), { listingId: listing.id, hostId: strangerId, patch: { notes: 'mine now' } }))
+      .rejects.toMatchObject({ code: 'not_listing_host' })
+  })
+
+  it('refuses a listing that does not exist', async () => {
+    await expect(editListing(deps(), { listingId: 'nope', hostId, patch: { notes: 'x' } }))
+      .rejects.toMatchObject({ code: 'listing_not_found' })
+  })
+
+  it('refuses a cancelled or already-started table', async () => {
+    const cancelled = repository.seedListing({ hostId, startsAt: LATER, status: 'cancelled' })
+    await expect(editListing(deps(), { listingId: cancelled.id, hostId, patch: { notes: 'x' } }))
+      .rejects.toMatchObject({ code: 'listing_cancelled' })
+
+    const past = repository.seedListing({ hostId, startsAt: new Date('2026-07-01T14:00:00Z') })
+    await expect(editListing(deps(), { listingId: past.id, hostId, patch: { notes: 'x' } }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+
+  it('still validates the values it is given', async () => {
+    const listing = openListing()
+
+    await expect(editListing(deps(), { listingId: listing.id, hostId, patch: { paymentLink: 'javascript:alert(1)' } }))
+      .rejects.toBeInstanceOf(DomainError)
+    await expect(editListing(deps(), { listingId: listing.id, hostId, patch: { seatsOffered: 0 } }))
+      .rejects.toBeInstanceOf(DomainError)
+  })
+})
+
+describe('cancelListing', () => {
+  it('marks the listing cancelled and stamps the time', async () => {
+    const listing = openListing()
+
+    const result = await cancelListing(deps(), { listingId: listing.id, hostId })
+
+    expect(result.listing.status).toBe('cancelled')
+    expect(result.listing.cancelledAt).toEqual(NOW)
+  })
+
+  it('removes every approved guest and reports them for notification', async () => {
+    const listing = openListing()
+    const other = repository.seedUser({ name: 'Other' }).id
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+    repository.seedRequest({ tableId: listing.id, userId: other, status: 'approved' })
+
+    const result = await cancelListing(deps(), { listingId: listing.id, hostId })
+
+    expect(result.removedUserIds.sort()).toEqual([guestId, other].sort())
+    expect(repository.requests.every((r) => r.status === 'removed')).toBe(true)
+  })
+
+  it('declines pending requests rather than leaving them dangling', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'pending' })
+
+    const result = await cancelListing(deps(), { listingId: listing.id, hostId })
+
+    expect(result.declinedUserIds).toEqual([guestId])
+    expect(result.removedUserIds).toEqual([])
+  })
+
+  it('leaves already-withdrawn and already-declined requests alone', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'withdrawn' })
+
+    const result = await cancelListing(deps(), { listingId: listing.id, hostId })
+
+    expect(result.removedUserIds).toEqual([])
+    expect(result.declinedUserIds).toEqual([])
+    expect(repository.requests[0].status).toBe('withdrawn')
+  })
+
+  it('refuses anyone who is not the host', async () => {
+    const listing = openListing()
+
+    await expect(cancelListing(deps(), { listingId: listing.id, hostId: strangerId }))
+      .rejects.toMatchObject({ code: 'not_listing_host' })
+  })
+
+  it('refuses to cancel twice', async () => {
+    const listing = openListing()
+    await cancelListing(deps(), { listingId: listing.id, hostId })
+
+    await expect(cancelListing(deps(), { listingId: listing.id, hostId }))
+      .rejects.toMatchObject({ code: 'listing_cancelled' })
+  })
+
+  it('refuses to cancel a table that has already started', async () => {
+    const past = repository.seedListing({ hostId, startsAt: new Date('2026-07-01T14:00:00Z') })
+
+    await expect(cancelListing(deps(), { listingId: past.id, hostId }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+})
+```
+
+The "accepts a resubmitted form that repeats the frozen values" test is the one that keeps the manage page usable. An edit form posts every field on every submit, so a lock that rejects *any* value for a frozen field — rather than any *change* to it — would make the form permanently unsubmittable the moment one guest is approved.
+
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/tables/manage-listing`.
+
+- [ ] **Step 3: Implement**
+
+Create `lib/domain/tables/manage-listing.ts`:
+
+```ts
+import { DomainError } from '../errors'
+import {
+  MAX_EVENT_NAME_LENGTH, MAX_NOTES_LENGTH, MAX_PAYMENT_NOTE_LENGTH,
+  assertSeatPrice, assertSeatsOffered, cleanPaymentLink, cleanText,
+} from './create-listing'
+import { deriveListingState } from './derive'
+import type { CancelCascade, ListingPatch, TablesDeps } from './ports'
+import type { TableListing } from './types'
+
+export interface EditListingInput {
+  listingId: string
+  hostId: string
+  patch: ListingPatch
+}
+
+export interface CancelListingInput {
+  listingId: string
+  hostId: string
+}
+
+/**
+ * Every host mutation shares these four checks, in this order. The order is the
+ * error message the host sees, so it runs from most fundamental to least:
+ * exists, is yours, is alive, has not happened yet.
+ */
+async function loadEditableListing(deps: TablesDeps, listingId: string, hostId: string): Promise<TableListing> {
+  const listing = await deps.repository.findListingById(listingId)
+  if (!listing) {
+    throw new DomainError('listing_not_found', 'That table no longer exists.')
+  }
+  if (listing.hostId !== hostId) {
+    throw new DomainError('not_listing_host', 'Only the host can change this table.')
+  }
+  if (listing.status === 'cancelled') {
+    throw new DomainError('listing_cancelled', 'That table was cancelled.')
+  }
+  if (deriveListingState(listing, 0, deps.now()).isPast) {
+    throw new DomainError('listing_past', 'That table has already started.')
+  }
+  return listing
+}
+
+export async function editListing(deps: TablesDeps, input: EditListingInput): Promise<TableListing> {
+  const listing = await loadEditableListing(deps, input.listingId, input.hostId)
+  const approvedSeats = await deps.repository.countApprovedSeats(listing.id)
+
+  const patch: ListingPatch = {}
+
+  if (input.patch.eventName !== undefined) {
+    patch.eventName = cleanText(input.patch.eventName, MAX_EVENT_NAME_LENGTH, 'The event name')
+  }
+  if (input.patch.notes !== undefined) {
+    patch.notes = cleanText(input.patch.notes, MAX_NOTES_LENGTH, 'Notes')
+  }
+  if (input.patch.paymentNote !== undefined) {
+    patch.paymentNote = cleanText(input.patch.paymentNote, MAX_PAYMENT_NOTE_LENGTH, 'The payment note')
+  }
+  if (input.patch.paymentLink !== undefined) {
+    patch.paymentLink = cleanPaymentLink(input.patch.paymentLink)
+  }
+
+  if (input.patch.seatsOffered !== undefined && input.patch.seatsOffered !== listing.seatsOffered) {
+    assertSeatsOffered(input.patch.seatsOffered)
+    if (input.patch.seatsOffered < approvedSeats) {
+      throw new DomainError(
+        'invalid_input',
+        `You have already approved ${approvedSeats} ${approvedSeats === 1 ? 'guest' : 'guests'}. You cannot offer fewer seats than that.`,
+        { approvedSeats },
+      )
+    }
+    patch.seatsOffered = input.patch.seatsOffered
+  }
+
+  // Price and start time are frozen once anyone has been approved. People agreed
+  // to a specific price at a specific time; changing either on them silently is
+  // the one thing that would destroy trust in the product. A host who genuinely
+  // needs different terms cancels and relists.
+  //
+  // Note this compares against the CURRENT value rather than rejecting the field
+  // outright: the manage form posts every field on every submit, so an unchanged
+  // value must be accepted or the form becomes unsubmittable after one approval.
+  if (input.patch.seatPrice !== undefined && input.patch.seatPrice !== listing.seatPrice) {
+    if (approvedSeats > 0) {
+      throw new DomainError('listing_locked', 'You cannot change the price once someone has been approved. Cancel and relist instead.')
+    }
+    assertSeatPrice(input.patch.seatPrice)
+    patch.seatPrice = input.patch.seatPrice
+  }
+
+  if (input.patch.startsAt !== undefined && input.patch.startsAt.getTime() !== listing.startsAt.getTime()) {
+    if (approvedSeats > 0) {
+      throw new DomainError('listing_locked', 'You cannot change the time once someone has been approved. Cancel and relist instead.')
+    }
+    if (input.patch.startsAt.getTime() <= deps.now().getTime()) {
+      throw new DomainError('invalid_input', 'A table has to start in the future.')
+    }
+    patch.startsAt = input.patch.startsAt
+  }
+
+  if (Object.keys(patch).length === 0) return listing
+
+  return deps.repository.updateListing(listing.id, patch)
+}
+
+export async function cancelListing(deps: TablesDeps, input: CancelListingInput): Promise<CancelCascade> {
+  const listing = await loadEditableListing(deps, input.listingId, input.hostId)
+
+  // The cascade — approved to removed, pending to declined — happens inside the
+  // repository's transaction so no guest is ever attached to a cancelled table.
+  return deps.repository.cancelListing(listing.id, input.hostId, deps.now())
+}
+```
+
+- [ ] **Step 4: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+Expected: all manage-listing tests pass.
+
+- [ ] **Step 5: Commit and push**
+
+```bash
+git add lib/domain/tables/manage-listing.ts tests/domain/tables/manage-listing.test.ts
+git commit -m "feat: add listing editing with frozen terms and cancellation cascade"
+git push
+```
+
+---
