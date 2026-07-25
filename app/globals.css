@@ -3,13 +3,32 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+
+  /* Landing palette. Warm near-black, not blue-black — this is a room with
+     amber light in it, not a screen. */
+  --ink: #0c0a08;
+  --ink-raised: #151109;
+  --paper: #f4efe6;
+  --paper-dim: #a89e8e;
+  --ember: #ff7a45;
+  --ember-deep: #c2410c;
+  --sand: #d9c9a8;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-sans-custom);
+  --font-mono: var(--font-mono-custom);
+  --font-display: var(--font-display);
+
+  --color-ink: var(--ink);
+  --color-ink-raised: var(--ink-raised);
+  --color-paper: var(--paper);
+  --color-paper-dim: var(--paper-dim);
+  --color-ember: var(--ember);
+  --color-ember-deep: var(--ember-deep);
+  --color-sand: var(--sand);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -22,5 +41,74 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  /* The scaffold shipped `Arial, Helvetica, sans-serif` here, which silently
+     overrode the loaded webfonts everywhere. */
+  font-family: var(--font-sans-custom), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Landing page only. Committed dark: a nightlife product that renders bright */
+/* white is telling you about the wrong room.                                 */
+/* ------------------------------------------------------------------------- */
+
+.landing {
+  background-color: var(--ink);
+  color: var(--paper);
+}
+
+/* A single warm light source, up and to the left, like a lamp over a table. */
+.landing-glow {
+  background:
+    radial-gradient(58rem 42rem at 12% -8%, rgba(255, 122, 69, 0.16), transparent 62%),
+    radial-gradient(38rem 30rem at 92% 8%, rgba(194, 65, 12, 0.10), transparent 58%);
+}
+
+/* Film grain, so the flat dark has a surface. */
+.grain::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.hairline {
+  border-color: color-mix(in oklab, var(--sand) 22%, transparent);
+}
+
+/* One orchestrated page load, staggered with inline animation-delay. */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(1rem); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes draw-rule {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+@keyframes ember-in {
+  from { opacity: 0; transform: translateY(1.25rem) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+
+.rise {
+  animation: rise-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.rule {
+  transform-origin: left;
+  animation: draw-rule 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.ember-rise {
+  animation: ember-in 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .rule, .ember-rise {
+    animation: none;
+  }
 }

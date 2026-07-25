@@ -1,9 +1,19 @@
-import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
+import { Landing } from './landing'
 
+/**
+ * `/` is the public front door for anyone signed out, and the member's home
+ * once they are in.
+ *
+ * It deliberately does NOT redirect anonymous visitors to /login any more: an
+ * invite-only product still has to explain itself to the person holding a code.
+ *
+ * Plan 2 replaces the signed-in branch with the real feed. Leave the anonymous
+ * branch alone when it does.
+ */
 export default async function HomePage() {
   const session = await auth()
-  if (!session?.user) redirect('/login')
+  if (!session?.user) return <Landing />
 
   return (
     <main className="mx-auto max-w-sm px-6 py-10">
