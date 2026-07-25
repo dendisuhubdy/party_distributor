@@ -1571,6 +1571,8 @@ describe('issueInvites', () => {
 
 The distinction between the "does not replenish spent codes" test and the "does not count expired codes" test is the product rule from the spec: spent codes are a deliberate throttle on growth, expired ones are just waste.
 
+**This is where the quota is easy to get wrong.** An implementation that counts only *live* codes against the quota — the obvious reading of "top a member up to three" — replenishes a slot every time someone redeems, so a member can invite without limit and the community grows exponentially. That is precisely the throttle the spec asks for and would silently remove it. An earlier draft of this plan had exactly that bug; the "does not replenish codes that were spent" test caught it on first run. Count redeemed codes against the quota too.
+
 - [ ] **Step 8: Run the tests, confirm they fail, then implement**
 
 ```bash
@@ -1612,11 +1614,17 @@ export async function issueInvites(deps: MembershipDeps, input: IssueInvitesInpu
   const existing = await repository.listInvitesCreatedBy(input.userId)
   const taken = new Set(existing.map((invite) => invite.code))
 
-  const live = existing.filter(
-    (invite) => invite.redeemedAt === null && invite.expiresAt.getTime() >= now().getTime(),
+  // A code counts against the quota if it has been redeemed OR is still live.
+  //
+  // Counting only live codes would mean every redemption frees a slot, so a
+  // member could invite without limit and the community would grow
+  // exponentially — the exact opposite of the throttle this quota exists to be.
+  // Only codes that expired unredeemed are forgiven: those are waste, not use.
+  const consumed = existing.filter(
+    (invite) => invite.redeemedAt !== null || invite.expiresAt.getTime() >= now().getTime(),
   )
 
-  const shortfall = INVITE_QUOTA - live.length
+  const shortfall = INVITE_QUOTA - consumed.length
   if (shortfall <= 0) return []
 
   const expiresAt = new Date(now().getTime() + INVITE_TTL_DAYS * MS_PER_DAY)

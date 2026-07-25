@@ -27,6 +27,7 @@ export type DomainErrorCode =
   | 'seat_request_already_decided'
   // shared
   | 'invalid_amount'
+  | 'invalid_input'
 
 export class DomainError extends Error {
   constructor(
