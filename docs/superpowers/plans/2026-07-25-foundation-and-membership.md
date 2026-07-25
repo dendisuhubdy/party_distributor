@@ -2552,7 +2552,29 @@ function JoinForm() {
 
 Prefilling the code from `?code=` is what makes a shared link work in one tap, which is how codes will actually travel.
 
-- [ ] **Step 6: Verify manually**
+- [ ] **Step 6: Test the action itself, not just the domain under it**
+
+The action is the one place form strings meet the domain, and where a `DomainError` has to become a rendered message rather than a 500. It is worth a test of its own — a server action is just an async function, so it can be called directly.
+
+Importing it pulls in `lib/auth`, and next-auth does `import ... from 'next/server'`, which only resolves under the Next compiler. Add to `vitest.integration.config.ts`:
+
+```ts
+  resolve: {
+    alias: [{ find: /^next\/server$/, replacement: 'next/server.js' }],
+  },
+```
+
+and inside `test`, so the alias actually reaches a dependency Vitest would otherwise externalize:
+
+```ts
+    server: { deps: { inline: [/next-auth/, /@auth\//] } },
+```
+
+Then create `tests/integration/join-action.test.ts` covering the error paths — nonexistent code, malformed code, already redeemed, expired, email taken, blank name — asserting on the returned `state.error`, plus one test that a rejection writes nothing at all.
+
+For the success path, note that `signIn` throws a redirect outside a request context. Everything under test has already committed by then, which is precisely the ordering the action relies on, so `await joinAction(...).catch(() => undefined)` and then assert on the database: the member exists with a trimmed name and normalized email, the invite is spent and attributed, and the new member holds three codes of their own.
+
+- [ ] **Step 7: Verify manually**
 
 ```bash
 npm run dev
