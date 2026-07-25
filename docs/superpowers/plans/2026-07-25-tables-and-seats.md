@@ -3798,26 +3798,30 @@ Every time on every screen goes through `formatEventTime`, which pins the zone t
 
 - [ ] **Step 6: Build the feed**
 
-Replace `app/page.tsx`:
+Replace `app/page.tsx`. **`/` already serves a public landing page to anyone signed out** — keep that branch exactly as it is and put the feed in the signed-in branch. Do not add `requireUserId()` at the top of this page: that would redirect anonymous visitors to `/login` and delete the front door.
 
 ```tsx
 import Link from 'next/link'
+import { auth } from '@/lib/auth'
 import { isDomainError } from '@/lib/domain/errors'
 import { listFeed } from '@/lib/domain/tables/list-feed'
 import type { ListingSummary } from '@/lib/domain/tables/types'
-import { requireUserId } from '@/lib/session'
 import { tablesDeps } from '@/lib/tables-service'
+import { Landing } from './landing'
 import { ListingCard } from './listing-card'
 
 const fieldClass =
   'rounded-lg border border-neutral-300 px-3 py-2 text-base dark:border-neutral-700 dark:bg-neutral-950'
 
-export default async function FeedPage({
+export default async function HomePage({
   searchParams,
 }: {
   searchParams: Promise<{ venue?: string; from?: string; to?: string }>
 }) {
-  await requireUserId()
+  // Signed out: the public front door, not a redirect to /login.
+  const session = await auth()
+  if (!session?.user?.id) return <Landing />
+
   const { venue, from, to } = await searchParams
 
   const venues = await tablesDeps.repository.listVenues()
