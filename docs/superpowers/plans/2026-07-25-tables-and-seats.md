@@ -477,7 +477,9 @@ export class FakePartyRepository implements TablesRepository, SeatsRepository {
   async updateListing(listingId: string, patch: ListingPatch): Promise<TableListing> {
     const listing = this.listings.find((l) => l.id === listingId)!
     for (const [key, value] of Object.entries(patch)) {
-      if (value !== undefined) (listing as Record<string, unknown>)[key] = value
+      // Double-assert through unknown: TableListing has no index signature,
+      // so a direct cast is TS2352 ("not sufficiently overlapping").
+      if (value !== undefined) (listing as unknown as Record<string, unknown>)[key] = value
     }
     return listing
   }
