@@ -514,11 +514,30 @@ export function formatRupiah(amount: Rupiah): string {
   return `${sign}Rp ${grouped}`
 }
 
-export function parseRupiah(input: string): Rupiah {
-  // Strip the currency symbol and every separator a person might type or paste.
-  const digits = input.trim().replace(/^Rp/i, '').replace(/[.,\s ]/g, '')
+/** Digits only: `2500000`. */
+const PLAIN = /^\d+$/
 
-  if (!/^\d+$/.test(digits)) {
+/**
+ * Digits grouped in threes by one consistent separator: `2.500.000`,
+ * `2,500,000`, `2 500 000`.
+ *
+ * The grouping is validated rather than stripped. Stripping every separator
+ * first and checking for digits afterwards accepts `2500.50` and returns
+ * 250,050 — a hundredfold error, on the one input a person is most likely to
+ * type when they mean a fraction. Mixed separators like `2.500,000` are
+ * ambiguous and rejected for the same reason.
+ */
+const GROUPED = /^\d{1,3}(([.,\s])\d{3}(\2\d{3})*)$/
+
+export function parseRupiah(input: string): Rupiah {
+  const trimmed = input.trim().replace(/^Rp\s*/i, '').trim()
+
+  let digits: string
+  if (PLAIN.test(trimmed)) {
+    digits = trimmed
+  } else if (GROUPED.test(trimmed)) {
+    digits = trimmed.replace(/[.,\s]/g, '')
+  } else {
     throw new DomainError('invalid_amount', 'Enter a whole amount in rupiah, for example 2.500.000.', { input })
   }
 
@@ -540,7 +559,11 @@ export function multiplyRupiah(amount: Rupiah, quantity: number): Rupiah {
 }
 ```
 
-Note that `parseRupiah` strips `.` and `,` identically. Indonesian uses `.` for thousands, English uses `,`, and both appear in pasted numbers. Because fractional rupiah are rejected outright, treating both as noise cannot misread a decimal point — `'2500.50'` fails the digit check rather than silently becoming 250,050.
+`parseRupiah` treats `.` and `,` identically as thousands separators, because Indonesian uses `.`, English uses `,`, and both appear in pasted numbers.
+
+**It must validate the grouping rather than strip the separators.** The obvious implementation — strip everything non-digit, then test `/^\d+$/` — accepts `'2500.50'` and returns 250,050. That is a hundredfold error on exactly the input someone types when they mean a fraction, and it is silent. The `GROUPED` pattern above requires groups of exactly three digits joined by a single consistent separator, so `'2500.50'`, `'2.50.000'`, and the ambiguous `'2.500,000'` are all rejected.
+
+This was a genuine defect in an earlier draft of this plan, caught by the "rejects input that is not a whole amount of rupiah" test. Do not simplify it back.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
