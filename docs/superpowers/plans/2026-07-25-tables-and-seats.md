@@ -3146,3 +3146,463 @@ git push
 ```
 
 ---
+
+### Task 9: PostgreSQL seats repository and the oversell guard
+
+The load-bearing task of this plan. A host tapping approve on a phone and a laptop at the same moment must not put nine people at an eight-seat table.
+
+**Files:**
+- Create: `lib/db/repositories/seats.ts`
+- Test: `tests/integration/seats-repository.test.ts`
+
+**Interfaces:**
+- Consumes: `SeatsRepository`, `ApproveOutcome` (Task 6); `SUMMARY_COLUMNS`, `toSummary` (Task 8); `db` and schema (Plan 1 Task 3).
+- Produces: `class PostgresSeatsRepository implements SeatsRepository`, constructed as `new PostgresSeatsRepository(db)`.
+
+- [ ] **Step 1: Write the failing integration tests**
+
+Create `tests/integration/seats-repository.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { eq } from 'drizzle-orm'
+import { db } from '@/lib/db/client'
+import { seatPayments, seatRequests } from '@/lib/db/schema'
+import { PostgresSeatsRepository } from '@/lib/db/repositories/seats'
+import { seedListing, seedRequest, seedUser, seedVenue, truncateAll } from '../support/db-helpers'
+
+const repository = new PostgresSeatsRepository(db)
+
+let hostId: string
+let venueId: string
+
+beforeEach(async () => {
+  await truncateAll()
+  hostId = (await seedUser({ email: 'host@example.com', name: 'Host' })).id
+  venueId = (await seedVenue({ name: 'Savaya', city: 'Bali' })).id
+})
+
+const guest = (n: number) => seedUser({ email: `guest-${n}@example.com`, name: `Guest ${n}` })
+
+describe('reads', () => {
+  it('returns the slice of a listing that seat decisions need', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 3, seatPrice: 2_500_000 })
+
+    const found = await repository.findListingForSeats(listing.id)
+
+    expect(found).toMatchObject({ id: listing.id, hostId, seatsOffered: 3, seatPrice: 2_500_000, status: 'open' })
+    expect(found!.startsAt).toBeInstanceOf(Date)
+  })
+
+  it('returns null for a listing that does not exist', async () => {
+    expect(await repository.findListingForSeats('00000000-0000-0000-0000-000000000000')).toBeNull()
+  })
+
+  it('finds a pending or approved request but ignores settled ones', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    const b = await guest(2)
+    const c = await guest(3)
+    await seedRequest({ tableId: listing.id, hostId, userId: a.id, status: 'pending' })
+    await seedRequest({ tableId: listing.id, hostId, userId: b.id, status: 'approved' })
+    await seedRequest({ tableId: listing.id, hostId, userId: c.id, status: 'declined' })
+
+    expect(await repository.findActiveRequest(listing.id, a.id)).toMatchObject({ status: 'pending' })
+    expect(await repository.findActiveRequest(listing.id, b.id)).toMatchObject({ status: 'approved' })
+    expect(await repository.findActiveRequest(listing.id, c.id)).toBeNull()
+  })
+
+  it('inserts a request carrying the denormalized host id', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+
+    const request = await repository.insertRequest({
+      tableId: listing.id, hostId, userId: a.id, message: 'Bringing a friend',
+    })
+
+    expect(request).toMatchObject({ tableId: listing.id, hostId, userId: a.id, status: 'pending' })
+    expect(request.message).toBe('Bringing a friend')
+  })
+
+  it('is rejected by the database if a host tries to take a seat at their own table', async () => {
+    // Belt and braces: the domain refuses this, and so does the check constraint.
+    const listing = await seedListing({ hostId, venueId })
+
+    await expect(repository.insertRequest({
+      tableId: listing.id, hostId, userId: hostId, message: null,
+    })).rejects.toThrow()
+  })
+
+  it('is rejected by the database on a second active request from the same person', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    await repository.insertRequest({ tableId: listing.id, hostId, userId: a.id, message: null })
+
+    await expect(repository.insertRequest({
+      tableId: listing.id, hostId, userId: a.id, message: null,
+    })).rejects.toThrow()
+  })
+
+  it('lists a roster oldest first with each guest attached', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    const b = await guest(2)
+    await seedRequest({ tableId: listing.id, hostId, userId: a.id })
+    await seedRequest({ tableId: listing.id, hostId, userId: b.id })
+
+    const roster = await repository.listRequestsForListing(listing.id)
+
+    expect(roster.map((entry) => entry.user.name)).toEqual(['Guest 1', 'Guest 2'])
+  })
+
+  it('lists the live seats a member holds with the full listing summary', async () => {
+    const soon = await seedListing({ hostId, venueId, startsAt: new Date('2099-01-01T14:00:00Z') })
+    const later = await seedListing({ hostId, venueId, startsAt: new Date('2099-06-01T14:00:00Z') })
+    const settled = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    await seedRequest({ tableId: later.id, hostId, userId: a.id, status: 'approved' })
+    await seedRequest({ tableId: soon.id, hostId, userId: a.id, status: 'pending' })
+    await seedRequest({ tableId: settled.id, hostId, userId: a.id, status: 'declined' })
+
+    const held = await repository.listSeatsHeldBy(a.id)
+
+    expect(held.map((h) => h.listing.listing.id)).toEqual([soon.id, later.id])
+    expect(held[0].listing.venue.name).toBe('Savaya')
+    expect(held[0].listing.host.name).toBe('Host')
+  })
+})
+
+describe('setRequestStatus', () => {
+  it('records the new status with who set it and when', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    const request = await seedRequest({ tableId: listing.id, hostId, userId: a.id })
+    const at = new Date('2026-08-01T12:00:00.000Z')
+
+    const updated = await repository.setRequestStatus(request.id, 'declined', at, hostId)
+
+    expect(updated).toMatchObject({ status: 'declined', decidedBy: hostId })
+    expect(updated.decidedAt).toEqual(at)
+  })
+})
+
+describe('approveIfSeatAvailable', () => {
+  it('approves into a free seat and captures the price at that moment', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 2, seatPrice: 2_500_000 })
+    const a = await guest(1)
+    const request = await seedRequest({ tableId: listing.id, hostId, userId: a.id })
+
+    const outcome = await repository.approveIfSeatAvailable(request.id, hostId, new Date())
+
+    expect(outcome.ok).toBe(true)
+
+    const [payment] = await db.select().from(seatPayments).where(eq(seatPayments.seatRequestId, request.id))
+    expect(payment.amount).toBe(2_500_000)
+    expect(payment.markedPaidAt).toBeNull()
+    expect(payment.confirmedAt).toBeNull()
+  })
+
+  it('reports a full table without changing anything', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 1 })
+    const taken = await guest(1)
+    const waiting = await guest(2)
+    await seedRequest({ tableId: listing.id, hostId, userId: taken.id, status: 'approved' })
+    const request = await seedRequest({ tableId: listing.id, hostId, userId: waiting.id })
+
+    const outcome = await repository.approveIfSeatAvailable(request.id, hostId, new Date())
+
+    expect(outcome).toEqual({ ok: false, reason: 'table_full' })
+
+    const [row] = await db.select().from(seatRequests).where(eq(seatRequests.id, request.id))
+    expect(row.status).toBe('pending')
+  })
+
+  it('reports a request that is no longer pending', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const a = await guest(1)
+    const request = await seedRequest({ tableId: listing.id, hostId, userId: a.id, status: 'declined' })
+
+    expect(await repository.approveIfSeatAvailable(request.id, hostId, new Date()))
+      .toEqual({ ok: false, reason: 'already_decided' })
+  })
+
+  it('lets a withdrawn seat be filled by someone else', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 1 })
+    const gone = await guest(1)
+    const next = await guest(2)
+    await seedRequest({ tableId: listing.id, hostId, userId: gone.id, status: 'withdrawn' })
+    const request = await seedRequest({ tableId: listing.id, hostId, userId: next.id })
+
+    expect((await repository.approveIfSeatAvailable(request.id, hostId, new Date())).ok).toBe(true)
+  })
+
+  it('lets exactly one of four simultaneous approvals into the last seat', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 1 })
+    const requests = []
+    for (let i = 1; i <= 4; i++) {
+      const g = await guest(i)
+      requests.push(await seedRequest({ tableId: listing.id, hostId, userId: g.id }))
+    }
+
+    const outcomes = await Promise.all(
+      requests.map((request) => repository.approveIfSeatAvailable(request.id, hostId, new Date())),
+    )
+
+    expect(outcomes.filter((o) => o.ok)).toHaveLength(1)
+    expect(outcomes.filter((o) => !o.ok && o.reason === 'table_full')).toHaveLength(3)
+
+    const approved = await db.select().from(seatRequests).where(eq(seatRequests.status, 'approved'))
+    expect(approved).toHaveLength(1)
+
+    // And exactly one payment row, because the insert lives inside the same
+    // transaction as the approval.
+    expect(await db.select().from(seatPayments)).toHaveLength(1)
+  })
+
+  it('fills every seat and no more when approvals arrive together', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 3 })
+    const requests = []
+    for (let i = 1; i <= 8; i++) {
+      const g = await guest(i)
+      requests.push(await seedRequest({ tableId: listing.id, hostId, userId: g.id }))
+    }
+
+    const outcomes = await Promise.all(
+      requests.map((request) => repository.approveIfSeatAvailable(request.id, hostId, new Date())),
+    )
+
+    expect(outcomes.filter((o) => o.ok)).toHaveLength(3)
+
+    const approved = await db.select().from(seatRequests).where(eq(seatRequests.status, 'approved'))
+    expect(approved).toHaveLength(3)
+  })
+})
+```
+
+The last two tests are why this task is separate from every other. Everything else here could be verified by reading the code; these cannot.
+
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+```bash
+npm run test:integration
+```
+
+Expected: failure resolving `@/lib/db/repositories/seats`.
+
+- [ ] **Step 3: Implement**
+
+Create `lib/db/repositories/seats.ts`:
+
+```ts
+import { and, asc, eq, inArray, sql } from 'drizzle-orm'
+import type { Db } from '../client'
+import { seatPayments, seatRequests, tableListings, users, venues } from '../schema'
+import { SUMMARY_COLUMNS, toSummary } from './tables'
+import type {
+  ApproveOutcome, NewSeatRequest, SeatListing, SeatsRepository,
+} from '@/lib/domain/seats/ports'
+import type { HeldSeat, RosterEntry, SeatRequest, SeatRequestStatus } from '@/lib/domain/seats/types'
+
+type SeatRequestRow = typeof seatRequests.$inferSelect
+
+function toSeatRequest(row: SeatRequestRow): SeatRequest {
+  return {
+    id: row.id,
+    tableId: row.tableId,
+    hostId: row.hostId,
+    userId: row.userId,
+    message: row.message,
+    status: row.status,
+    decidedAt: row.decidedAt,
+    decidedBy: row.decidedBy,
+    createdAt: row.createdAt,
+  }
+}
+
+const ACTIVE: SeatRequestStatus[] = ['pending', 'approved']
+
+export class PostgresSeatsRepository implements SeatsRepository {
+  constructor(private readonly db: Db) {}
+
+  async findListingForSeats(listingId: string): Promise<SeatListing | null> {
+    const [row] = await this.db.select({
+      id: tableListings.id,
+      hostId: tableListings.hostId,
+      startsAt: tableListings.startsAt,
+      seatsOffered: tableListings.seatsOffered,
+      seatPrice: tableListings.seatPrice,
+      status: tableListings.status,
+    }).from(tableListings).where(eq(tableListings.id, listingId)).limit(1)
+
+    return row ?? null
+  }
+
+  async findActiveRequest(listingId: string, userId: string): Promise<SeatRequest | null> {
+    const [row] = await this.db.select().from(seatRequests)
+      .where(and(
+        eq(seatRequests.tableId, listingId),
+        eq(seatRequests.userId, userId),
+        inArray(seatRequests.status, ACTIVE),
+      ))
+      .limit(1)
+
+    return row ? toSeatRequest(row) : null
+  }
+
+  async countApprovedSeats(listingId: string): Promise<number> {
+    const [row] = await this.db.select({ approved: sql<number>`count(*)`.mapWith(Number) })
+      .from(seatRequests)
+      .where(and(eq(seatRequests.tableId, listingId), eq(seatRequests.status, 'approved')))
+    return row?.approved ?? 0
+  }
+
+  async insertRequest(input: NewSeatRequest): Promise<SeatRequest> {
+    const [row] = await this.db.insert(seatRequests).values(input).returning()
+    return toSeatRequest(row)
+  }
+
+  async findRequestById(requestId: string): Promise<SeatRequest | null> {
+    const [row] = await this.db.select().from(seatRequests)
+      .where(eq(seatRequests.id, requestId)).limit(1)
+    return row ? toSeatRequest(row) : null
+  }
+
+  async listRequestsForListing(listingId: string): Promise<RosterEntry[]> {
+    const rows = await this.db.select({
+      request: seatRequests,
+      userId: users.id,
+      userName: users.name,
+      userInstagram: users.instagramHandle,
+    })
+      .from(seatRequests)
+      .innerJoin(users, eq(users.id, seatRequests.userId))
+      .where(eq(seatRequests.tableId, listingId))
+      .orderBy(asc(seatRequests.createdAt))
+
+    return rows.map((row) => ({
+      request: toSeatRequest(row.request),
+      user: { id: row.userId, name: row.userName, instagramHandle: row.userInstagram },
+    }))
+  }
+
+  async listSeatsHeldBy(userId: string): Promise<HeldSeat[]> {
+    const rows = await this.db.select({ ...SUMMARY_COLUMNS, request: seatRequests })
+      .from(seatRequests)
+      .innerJoin(tableListings, eq(tableListings.id, seatRequests.tableId))
+      .innerJoin(venues, eq(venues.id, tableListings.venueId))
+      .innerJoin(users, eq(users.id, tableListings.hostId))
+      .where(and(eq(seatRequests.userId, userId), inArray(seatRequests.status, ACTIVE)))
+      .orderBy(asc(tableListings.startsAt))
+
+    return rows.map((row) => ({ request: toSeatRequest(row.request), listing: toSummary(row) }))
+  }
+
+  /**
+   * The oversell guard.
+   *
+   * `SELECT ... FOR UPDATE` on the listing row serialises every concurrent
+   * approval for that table. The seat count is taken *after* the lock is held,
+   * so it cannot be stale: any competing approval either has not started
+   * counting yet, or has already committed and is visible to this statement's
+   * fresh READ COMMITTED snapshot.
+   *
+   * Locking the listing rather than the request rows is deliberate. The
+   * contended resource is the table's capacity, and only a row every approval
+   * for that table must touch can protect it. Locking the request would let two
+   * different requests race into the same last seat.
+   */
+  async approveIfSeatAvailable(requestId: string, decidedBy: string, at: Date): Promise<ApproveOutcome> {
+    return this.db.transaction(async (tx) => {
+      const [request] = await tx.select().from(seatRequests)
+        .where(eq(seatRequests.id, requestId)).limit(1)
+
+      if (!request || request.status !== 'pending') {
+        return { ok: false, reason: 'already_decided' }
+      }
+
+      const [listing] = await tx.select({
+        seatsOffered: tableListings.seatsOffered,
+        seatPrice: tableListings.seatPrice,
+      })
+        .from(tableListings)
+        .where(eq(tableListings.id, request.tableId))
+        .for('update')
+        .limit(1)
+
+      if (!listing) return { ok: false, reason: 'already_decided' }
+
+      const [counted] = await tx.select({ approved: sql<number>`count(*)`.mapWith(Number) })
+        .from(seatRequests)
+        .where(and(eq(seatRequests.tableId, request.tableId), eq(seatRequests.status, 'approved')))
+
+      if (counted.approved >= listing.seatsOffered) {
+        return { ok: false, reason: 'table_full' }
+      }
+
+      // The status predicate makes this a compare-and-set as well as an update,
+      // so a request decided since the read above cannot be approved twice.
+      const [updated] = await tx.update(seatRequests)
+        .set({ status: 'approved', decidedAt: at, decidedBy })
+        .where(and(eq(seatRequests.id, requestId), eq(seatRequests.status, 'pending')))
+        .returning()
+
+      if (!updated) return { ok: false, reason: 'already_decided' }
+
+      // The price is captured here, at approval, rather than read from the
+      // listing whenever the roster is rendered. It keeps every settled seat
+      // correct even if a future version relaxes the price freeze.
+      await tx.insert(seatPayments)
+        .values({ seatRequestId: updated.id, amount: listing.seatPrice })
+        .onConflictDoNothing()
+
+      return { ok: true, request: toSeatRequest(updated) }
+    })
+  }
+
+  async setRequestStatus(
+    requestId: string, status: SeatRequestStatus, at: Date, decidedBy: string,
+  ): Promise<SeatRequest> {
+    const [row] = await this.db.update(seatRequests)
+      .set({ status, decidedAt: at, decidedBy })
+      .where(eq(seatRequests.id, requestId))
+      .returning()
+    return toSeatRequest(row)
+  }
+}
+```
+
+- [ ] **Step 4: Run the integration tests**
+
+```bash
+npm run test:integration
+```
+
+Expected: every seats-repository test passes, including both concurrency tests.
+
+- [ ] **Step 5: Prove the concurrency tests can actually fail**
+
+A concurrency test that passes against unguarded code proves nothing. Delete one line — the `.for('update')` — from `approveIfSeatAvailable`:
+
+```ts
+        .from(tableListings)
+        .where(eq(tableListings.id, request.tableId))
+        .limit(1)
+```
+
+```bash
+npm run test:integration
+```
+
+Expected: "lets exactly one of four simultaneous approvals into the last seat" FAILS, reporting more than one winner, and the eight-into-three test overfills as well. **Restore `.for('update')`** and re-run to confirm both pass again.
+
+If the tests still pass without the lock, the four approvals are not actually running concurrently — check that `lib/db/client.ts` sets `max: 10` on the postgres client. With a pool of one, every transaction serialises by accident and the test is measuring nothing.
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add lib/db/repositories/seats.ts tests/integration/seats-repository.test.ts
+git commit -m "feat: add Postgres seats repository with row-locked oversell guard"
+git push
+```
+
+---
