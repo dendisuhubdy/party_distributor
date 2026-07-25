@@ -1732,16 +1732,56 @@ export async function seedUser(overrides: Partial<{ email: string; name: string 
 }
 ```
 
+Create `tests/support/db-clients.ts`:
+
+```ts
+import { drizzle } from 'drizzle-orm/postgres-js'
+import postgres from 'postgres'
+import * as schema from '@/lib/db/schema'
+
+const opened: Array<ReturnType<typeof postgres>> = []
+
+/**
+ * A Drizzle client on its own postgres.js pool.
+ *
+ * Required by any test that must exercise real contention. postgres.js
+ * pipelines work from a single client onto one connection in FIFO order — and
+ * that includes transactions, even with `max: 10`. So `Promise.all` over one
+ * client does NOT race: the second transaction's BEGIN is not sent until the
+ * first has finished, and a check-then-act implementation passes a concurrency
+ * test it should fail.
+ *
+ * Separate clients mean separate sockets, which is the only way two statements
+ * genuinely overlap.
+ */
+export function independentDb() {
+  const url = process.env.DATABASE_URL
+  if (!url) throw new Error('DATABASE_URL is not set')
+
+  const client = postgres(url, { max: 1 })
+  opened.push(client)
+  return drizzle(client, { schema })
+}
+
+/** Call from afterAll, or Vitest hangs waiting on the open sockets. */
+export async function closeIndependentDbs(): Promise<void> {
+  await Promise.all(opened.splice(0).map((client) => client.end()))
+}
+```
+
+**This file is the difference between a concurrency test that proves something and one that proves nothing.** It was added after the race test below was observed *passing* against a deliberately broken check-then-act implementation, because both racers were being serialised onto one connection.
+
 - [ ] **Step 2: Write the failing integration tests**
 
 Create `tests/integration/membership-repository.test.ts`:
 
 ```ts
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { eq } from 'drizzle-orm'
 import { db } from '@/lib/db/client'
 import { invites, users } from '@/lib/db/schema'
 import { PostgresMembershipRepository } from '@/lib/db/repositories/membership'
+import { closeIndependentDbs, independentDb } from '../support/db-clients'
 import { seedUser, truncateAll } from '../support/db-helpers'
 
 const repository = new PostgresMembershipRepository(db)
@@ -1752,6 +1792,8 @@ beforeEach(async () => {
   await truncateAll()
   hostId = (await seedUser({ email: 'host@example.com', name: 'Host' })).id
 })
+
+afterAll(closeIndependentDbs)
 
 async function seedInvite(code: string, expiresAt = new Date('2099-01-01T00:00:00Z')) {
   const [invite] = await db.insert(invites).values({ code, createdBy: hostId, expiresAt }).returning()
@@ -1824,11 +1866,17 @@ describe('PostgresMembershipRepository', () => {
   it('lets exactly one of two simultaneous redemptions win', async () => {
     const invite = await seedInvite('ABCD-EFGH')
 
+    // Two repositories on independent connections. Sharing one client does not
+    // race — postgres.js serialises even transactions onto a single connection,
+    // and a check-then-act implementation passes. See tests/support/db-clients.ts.
+    const racerA = new PostgresMembershipRepository(independentDb())
+    const racerB = new PostgresMembershipRepository(independentDb())
+
     const results = await Promise.all([
-      repository.claimInviteAndCreateUser(invite.id, {
+      racerA.claimInviteAndCreateUser(invite.id, {
         email: 'racer-a@example.com', name: 'Racer A', instagramHandle: null, invitedBy: hostId,
       }),
-      repository.claimInviteAndCreateUser(invite.id, {
+      racerB.claimInviteAndCreateUser(invite.id, {
         email: 'racer-b@example.com', name: 'Racer B', instagramHandle: null, invitedBy: hostId,
       }),
     ])
@@ -1975,21 +2023,28 @@ Expected: all tests pass, including the concurrent-redemption test.
 A concurrency test that would pass against broken code is worthless. Temporarily replace the body of `claimInviteAndCreateUser` with a naive check-then-act:
 
 ```ts
-    const [invite] = await this.db.select().from(invites).where(eq(invites.id, inviteId)).limit(1)
-    if (!invite || invite.redeemedAt !== null) return null
-    const [created] = await this.db.insert(users).values({
-      email: newUser.email, name: newUser.name,
-      instagramHandle: newUser.instagramHandle, invitedBy: newUser.invitedBy,
-    }).returning()
-    await this.db.update(invites).set({ redeemedBy: created.id, redeemedAt: new Date() }).where(eq(invites.id, inviteId))
-    return toUser(created)
+    // Check-then-act, but still inside a transaction. Keeping the transaction
+    // matters: without one, postgres.js runs both racers' statements on a single
+    // pooled connection and they cannot overlap at all, so this passes.
+    return this.db.transaction(async (tx) => {
+      const [invite] = await tx.select().from(invites).where(eq(invites.id, inviteId)).limit(1)
+      if (!invite || invite.redeemedAt !== null) return null
+      const [created] = await tx.insert(users).values({
+        email: newUser.email, name: newUser.name,
+        instagramHandle: newUser.instagramHandle, invitedBy: newUser.invitedBy,
+      }).returning()
+      await tx.update(invites).set({ redeemedBy: created.id, redeemedAt: new Date() }).where(eq(invites.id, inviteId))
+      return toUser(created)
+    })
 ```
 
 ```bash
 npm run test:integration
 ```
 
-Expected: "lets exactly one of two simultaneous redemptions win" FAILS with 2 winners. **Restore the correct implementation** and re-run to confirm it passes again.
+Expected: "lets exactly one of two simultaneous redemptions win" FAILS with 2 winners, and two `racer-` users exist. **Restore the correct implementation** and re-run to confirm it passes again.
+
+If it still passes, the two racers are not overlapping. Check that the test builds each repository with `independentDb()` rather than sharing the module-level `db` — that, not the implementation, is what determines whether this test can fail at all.
 
 - [ ] **Step 7: Commit**
 

@@ -3171,14 +3171,17 @@ The load-bearing task of this plan. A host tapping approve on a phone and a lapt
 Create `tests/integration/seats-repository.test.ts`:
 
 ```ts
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { eq } from 'drizzle-orm'
 import { db } from '@/lib/db/client'
 import { seatPayments, seatRequests } from '@/lib/db/schema'
 import { PostgresSeatsRepository } from '@/lib/db/repositories/seats'
+import { closeIndependentDbs, independentDb } from '../support/db-clients'
 import { seedListing, seedRequest, seedUser, seedVenue, truncateAll } from '../support/db-helpers'
 
 const repository = new PostgresSeatsRepository(db)
+
+afterAll(closeIndependentDbs)
 
 let hostId: string
 let venueId: string
@@ -3351,8 +3354,15 @@ describe('approveIfSeatAvailable', () => {
       requests.push(await seedRequest({ tableId: listing.id, hostId, userId: g.id }))
     }
 
+    // One repository per racer, each on its own connection. This is not
+    // optional: postgres.js pipelines a single client's transactions onto one
+    // connection, so `Promise.all` over `repository` would run them one after
+    // another and this test would pass even with no lock at all. See
+    // tests/support/db-clients.ts (Plan 1 Task 6).
+    const racers = requests.map(() => new PostgresSeatsRepository(independentDb()))
+
     const outcomes = await Promise.all(
-      requests.map((request) => repository.approveIfSeatAvailable(request.id, hostId, new Date())),
+      requests.map((request, i) => racers[i].approveIfSeatAvailable(request.id, hostId, new Date())),
     )
 
     expect(outcomes.filter((o) => o.ok)).toHaveLength(1)
@@ -3374,8 +3384,10 @@ describe('approveIfSeatAvailable', () => {
       requests.push(await seedRequest({ tableId: listing.id, hostId, userId: g.id }))
     }
 
+    const racers = requests.map(() => new PostgresSeatsRepository(independentDb()))
+
     const outcomes = await Promise.all(
-      requests.map((request) => repository.approveIfSeatAvailable(request.id, hostId, new Date())),
+      requests.map((request, i) => racers[i].approveIfSeatAvailable(request.id, hostId, new Date())),
     )
 
     expect(outcomes.filter((o) => o.ok)).toHaveLength(3)
@@ -3602,7 +3614,7 @@ npm run test:integration
 
 Expected: "lets exactly one of four simultaneous approvals into the last seat" FAILS, reporting more than one winner, and the eight-into-three test overfills as well. **Restore `.for('update')`** and re-run to confirm both pass again.
 
-If the tests still pass without the lock, the four approvals are not actually running concurrently — check that `lib/db/client.ts` sets `max: 10` on the postgres client. With a pool of one, every transaction serialises by accident and the test is measuring nothing.
+If the tests still pass without the lock, the four approvals are not overlapping and the test is measuring nothing. The cause is almost certainly that they share one Drizzle client: postgres.js pipelines a single client's work onto a single connection in FIFO order, transactions included, regardless of `max`. Each racer needs its own client via `independentDb()`. Raising `max` does not help and never did.
 
 - [ ] **Step 6: Commit and push**
 
