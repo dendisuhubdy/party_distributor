@@ -4007,3 +4007,250 @@ git push
 ```
 
 ---
+
+### Task 12: Cut over to wazup.party and make email real
+
+The last task in the project, and the one that turns a working app into a product other people can use. Plan 1 shipped to an `sslip.io` hostname with Resend's shared test sender, which meant only the founder could ever receive a sign-in link. A real domain fixes both at once.
+
+**This task supersedes the `sslip.io` hostname in Plan 1 Task 11.** Everything else there — the Droplet, the Compose stack, the nightly `pg_dump`, the firewall — stands unchanged.
+
+**Files:**
+- Modify: `Caddyfile`, `.env` on the Droplet, `.env.example`, `README.md`
+- Modify: `docs/superpowers/specs/2026-07-25-party-table-splitting-design.md`
+
+**Interfaces:**
+- Consumes: the deployment from Plan 1 Task 11; `APP_URL` (Task 8).
+- Produces: the app served at `https://wazup.party` with a real certificate, and magic links that reach anybody.
+
+- [ ] **Step 1: Point the domain at the Droplet**
+
+In the Cloudflare dashboard for `wazup.party`, create:
+
+| Type | Name | Content | Proxy |
+|---|---|---|---|
+| A | `@` | the Droplet's IPv4 | **DNS only** |
+| A | `www` | the Droplet's IPv4 | **DNS only** |
+
+**Proxy must be off (grey cloud), at least to begin with.** Caddy obtains its own Let's Encrypt certificate, and Cloudflare's proxy terminates TLS itself. Left on the default "Flexible" SSL mode, the proxy speaks plain HTTP to the origin while Caddy redirects HTTP to HTTPS — an infinite redirect loop that looks exactly like an application bug. Off, Caddy's certificate is the one browsers see, and the app sees real client IPs.
+
+Turning the proxy on later is fine, but only after setting SSL/TLS mode to **Full (strict)** so Cloudflare validates Caddy's certificate. Do that as a separate change, once the site is confirmed working.
+
+Wait for propagation:
+
+```bash
+dig +short wazup.party
+dig +short www.wazup.party
+```
+
+Both must return the Droplet's IP before continuing. Caddy's HTTP-01 challenge fails if the name does not yet resolve, and repeated failures hit Let's Encrypt rate limits.
+
+- [ ] **Step 2: Serve the domain**
+
+Replace `Caddyfile`:
+
+```
+wazup.party {
+	encode zstd gzip
+	reverse_proxy web:3000
+}
+
+www.wazup.party {
+	redir https://wazup.party{uri} permanent
+}
+```
+
+Caddy provisions and renews certificates for both names automatically. There is no ACME configuration to write — that is the entire reason Caddy is in this stack rather than nginx.
+
+- [ ] **Step 3: Update the environment on the Droplet**
+
+```bash
+ssh root@<droplet-ip>
+cd /opt/party
+```
+
+Edit `.env` so it contains:
+
+```
+DATABASE_URL=postgres://party:party@db:5432/party
+AUTH_URL=https://wazup.party
+APP_URL=https://wazup.party
+AUTH_TRUST_HOST=true
+AUTH_SECRET=<the existing secret — do not regenerate, it invalidates every session>
+RESEND_API_KEY=<your key>
+EMAIL_FROM=Party <hello@wazup.party>
+CRON_SECRET=<the existing secret>
+FOUNDER_EMAIL=<your email>
+FOUNDER_NAME=<your name>
+```
+
+`AUTH_TRUST_HOST=true` is required because Auth.js sits behind Caddy and would otherwise refuse to trust the forwarded `Host` header, rejecting every callback. `APP_URL` is what `lib/notify-service.ts` builds email links from — leave it unset and every link in every email points at `localhost:3000`.
+
+Mirror the new key in `.env.example` so a fresh checkout knows it exists:
+
+```
+APP_URL=https://wazup.party
+```
+
+- [ ] **Step 4: Deploy and verify TLS**
+
+```bash
+cd /opt/party && git pull && docker compose up -d --build
+docker compose logs -f caddy   # watch the certificate being issued, then Ctrl-C
+```
+
+From your laptop:
+
+```bash
+curl -sSI https://wazup.party | head -1
+# Expect: HTTP/2 200
+
+curl -sSI http://wazup.party | head -3
+# Expect: a 308 or 301 to https://
+
+curl -sSI https://www.wazup.party | head -3
+# Expect: a 301 to https://wazup.party/
+
+echo | openssl s_client -connect wazup.party:443 -servername wazup.party 2>/dev/null \
+  | openssl x509 -noout -issuer -subject -dates
+# Expect: issuer Let's Encrypt, subject CN=wazup.party, not expired
+```
+
+- [ ] **Step 5: Verify the domain in Resend**
+
+In the Resend dashboard, add the domain `wazup.party`. Resend will show a set of records — a DKIM record, an SPF `TXT`, and an `MX` for a `send` subdomain. **Copy them exactly from the dashboard**; the hostnames and the SES region in the `MX` target differ between accounts, so any values written down here would be wrong for yours.
+
+Two Cloudflare-specific things will otherwise cost an afternoon:
+
+- **Set every Resend record to "DNS only".** Cloudflare cannot proxy a DKIM `CNAME` or an `MX`, and a proxied record silently fails verification.
+- **Cloudflare adds its own SPF entry** if email routing was ever enabled on the zone. Two separate `TXT` records both starting `v=spf1` is invalid SPF and fails as hard as none. Merge them into one record, or remove the unused one.
+
+Then add a DMARC record so mailbox providers know what to do with anything that fails the above:
+
+| Type | Name | Content |
+|---|---|---|
+| TXT | `_dmarc` | `v=DMARC1; p=none; rua=mailto:<your email>` |
+
+`p=none` is deliberate for a new sending domain: it reports failures without having them rejected while the configuration settles. Tighten it to `quarantine` once the reports are clean.
+
+Wait for Resend to show the domain as **Verified**.
+
+- [ ] **Step 6: Prove a stranger can now sign in**
+
+This is the check the whole task exists for. On the live site, with a member who is **not** the Resend account owner:
+
+1. Issue an invite from `/invites` as the founder and send the link to a second person.
+2. They open `/join?code=…`, sign up, and receive a sign-in email at their own address.
+3. They click it and land signed in on the feed.
+
+Then confirm the email links point at the real origin, not localhost:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select kind, sent_at from email_log order by sent_at desc limit 5"
+```
+
+and read any received email's body — every URL must begin `https://wazup.party`.
+
+If links say `localhost:3000`, `APP_URL` is missing from `.env` on the Droplet. If the email never arrives, check Resend's dashboard logs before touching any code: a rejected send appears there with a reason, and it is almost always a DNS record still set to proxied.
+
+- [ ] **Step 7: Point the reminder cron at the domain**
+
+Plan 3 Task 10 Step 9 already installed `/etc/cron.d/party-reminders` against `https://wazup.party`. Confirm it works now that the name resolves:
+
+```bash
+. /opt/party/.env.cron && curl -sS -X POST \
+  -H "Authorization: Bearer $CRON_SECRET" https://wazup.party/api/cron/reminders
+# Expect: {"listings":N,...}
+```
+
+And confirm it is unreachable without the secret from outside:
+
+```bash
+curl -sI -X POST https://wazup.party/api/cron/reminders | head -1
+# Expect: HTTP/2 401
+```
+
+- [ ] **Step 8: Retire the known limitation from the docs**
+
+In `README.md`, replace the whole `### Known limitation: email` section with:
+
+```markdown
+### Email
+
+`wazup.party` is a verified sending domain in Resend, so magic links and
+notifications reach any member. `EMAIL_FROM` is `Party <hello@wazup.party>`.
+
+If deliverability degrades, check Resend's dashboard logs first — a rejected
+send is reported there with a reason, and the cause is nearly always a DNS
+record that got switched back to proxied in Cloudflare.
+```
+
+And replace the `## Production` section's TLS paragraph with:
+
+```markdown
+The site is served at https://wazup.party. DNS is on Cloudflare with the
+records set to **DNS only** — Caddy holds its own Let's Encrypt certificate,
+and Cloudflare's proxy in its default Flexible SSL mode would fight Caddy's
+HTTP-to-HTTPS redirect and produce a redirect loop. To enable the proxy, first
+set SSL/TLS mode to Full (strict).
+```
+
+In `docs/superpowers/specs/2026-07-25-party-table-splitting-design.md`, replace the `sslip.io` sentence in **Architecture → Deployment** and delete the **Known limitation** paragraph that follows it, replacing both with:
+
+```markdown
+**Deployment:** a single DigitalOcean Droplet running Docker Compose — Postgres,
+the app, and Caddy as a TLS-terminating reverse proxy. The site is served at
+`wazup.party`, with DNS on Cloudflare set to DNS-only so Caddy holds the
+certificate. `wazup.party` is a verified sending domain in Resend, so magic
+links reach any member. Self-hosting Postgres alongside the app rather than
+using a managed database is a deliberate cost choice for a personal account,
+and it makes nightly `pg_dump` backups the operator's responsibility.
+```
+
+A spec that still describes a workaround the product no longer uses is worse than no spec: the next person to read it will reintroduce the workaround.
+
+- [ ] **Step 9: Commit and push**
+
+```bash
+git add Caddyfile README.md .env.example docs/superpowers/specs
+git commit -m "chore: serve wazup.party with a verified Resend sending domain"
+git push
+```
+
+---
+
+## Definition of done
+
+- [ ] `npm test`, `npm run test:integration`, `npm run test:e2e`, `npm run lint`, and `npm run build` all pass.
+- [ ] `TZ=UTC npm test` and `TZ=America/New_York npm test` produce identical results.
+- [ ] No email template renders a UTC time — the `formatEventTime` assertion in `tests/domain/notify/templates.test.ts` covers every one of them.
+- [ ] Two dispatches of the same event to the same person send exactly one email, proven by the simultaneous-claim integration test against the real unique constraint.
+- [ ] With `RESEND_API_KEY` set to an invalid value, approving a seat still succeeds, logs a `[notify]` error, and writes **no** `email_log` row — so a retry after fixing the key would still send.
+- [ ] A guest who marks a seat paid sees "awaiting confirmation", and the host sees "Says paid" with a "Mark received" button.
+- [ ] Removing a guest whose payment was confirmed turns their row red, shows the refund banner, and excludes them from "Still to collect".
+- [ ] `POST /api/cron/reminders` returns 401 without the secret, 405 on `GET`, and a summary with the secret; a second call the same day reports `sent: 0` with a non-zero `skipped`.
+- [ ] `https://wazup.party` serves a valid Let's Encrypt certificate, and `http://` and `www.` both redirect to it.
+- [ ] A member who is **not** the Resend account owner has received a magic link at their own address and signed in.
+- [ ] Every URL in a received email begins `https://wazup.party`.
+- [ ] `grep -rn "new Date(" lib/domain` returns only `event-time.ts`.
+- [ ] The README and the design spec no longer mention `sslip.io` or the shared test sender.
+
+## What is deliberately not done
+
+**No admin UI.** Suspending a member, replenishing spent invite codes, and merging duplicate venues remain direct database operations, as the spec intends. The recipient queries all filter `status = 'active'`, so suspending someone in psql does stop their email — the one moderation action that needed application support has it.
+
+**No refund workflow.** `refund_owed` is a flag and a banner. The platform never held the money and cannot return it; the honest boundary is to show the host that they owe it.
+
+**No HTML email.** Plain text only, one template per event. A second rendering per email would be a second thing to keep in sync for an audience reading all of this on a lock screen.
+
+**No unmarking or unconfirming a payment.** A host who taps "Mark received" by mistake fixes it in psql. Adding an undo means a second state transition, a second permission check, and a second email to decide about, for a mistake that costs one SQL statement to repair in a community this size.
+
+**No waitlist.** A full table refuses new requests. Pending requests may already outnumber seats, which covers the same need without a second queue to manage.
+
+## The product, end to end
+
+A member holds three invite codes and shares one. The person who redeems it becomes a member and signs in by email — no password, ever. They see a feed of upcoming tables, soonest first, filterable by venue and date, each showing the venue, the night, the price per seat, and how many spots are left in Bali time.
+
+A host who has already booked a table lists the spare seats at a fixed price. Every active member is emailed. Members ask for a seat with an optional note; the host is emailed, approves or declines each one, and cannot oversell the table however many devices they tap on. Approved guests are emailed the amount and the host's own payment link, mark the seat paid when they have, and the host confirms it arrived. The host's grid shows, most urgent first, who still owes and who is owed a refund. The day before, everyone gets one reminder with their own payment status.
+
+Nobody opens WhatsApp to make any of that happen, which is the whole point.
