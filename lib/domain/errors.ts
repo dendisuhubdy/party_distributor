@@ -19,12 +19,14 @@ export type DomainErrorCode =
   | 'listing_past'
   | 'listing_locked'
   | 'not_listing_host'
+  | 'venue_not_found'
   // seats (Plan 2)
   | 'table_full'
   | 'duplicate_seat_request'
   | 'host_cannot_join_own_table'
   | 'seat_request_not_found'
   | 'seat_request_already_decided'
+  | 'not_seat_owner'
   // shared
   | 'invalid_amount'
   | 'invalid_input'
