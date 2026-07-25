@@ -62,10 +62,21 @@ The founding member is seeded by migration, since invite codes require an invite
 ## Architecture
 
 **Stack:** Next.js 15 (App Router, TypeScript) · PostgreSQL · Drizzle ORM with drizzle-kit
-migrations · Auth.js v5 magic links · Resend for email · Tailwind with shadcn/ui ·
-DigitalOcean App Platform (web component plus managed Postgres).
+migrations · Auth.js v5 magic links · Resend for email · Tailwind with shadcn/ui.
 
 Next.js is the whole backend. There is no separate API service.
+
+**Deployment:** a single DigitalOcean Droplet running Docker Compose — Postgres, the app,
+and Caddy as a TLS-terminating reverse proxy. There is no domain, so Caddy serves an
+`sslip.io` hostname derived from the Droplet's IP; that name is publicly resolvable, so
+Let's Encrypt issues a real certificate for it. Self-hosting Postgres alongside the app
+rather than using a managed database is a deliberate cost choice for a personal account,
+and it makes nightly `pg_dump` backups the operator's responsibility.
+
+**Known limitation:** without a domain, Resend's shared test sender delivers only to the
+address on the Resend account. Magic links reach the founder and nobody else, so members
+cannot yet sign themselves in. Resolving it is a one-line provider change in `lib/auth.ts`
+— a verified sending domain, or Nodemailer against any SMTP mailbox.
 
 ### The one structural rule
 
@@ -192,10 +203,10 @@ All emails are idempotent through the `email_log` unique constraint, so retries 
 | Table cancelled, or seat removed | Affected guests |
 | Day before the event | Host and all approved guests, with payment status |
 
-The day-before reminder needs a scheduler. DigitalOcean App Platform has no built-in cron,
-so a `POST /api/cron/reminders` route guarded by a shared secret is triggered by a GitHub
-Actions scheduled workflow. This is deliberately boring and can move to a real scheduler
-without touching domain code.
+The day-before reminder needs a scheduler. Since the app runs on a Droplet we already
+control, this is simply a `POST /api/cron/reminders` route guarded by a shared secret,
+called by a `cron.daily` entry on the host — the same place the nightly database backup
+runs. No external scheduler, no third-party access to the box.
 
 ## Screens
 

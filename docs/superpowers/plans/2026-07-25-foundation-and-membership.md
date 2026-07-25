@@ -154,7 +154,9 @@ TEST_DATABASE_URL=postgres://party:party@localhost:5433/party_test
 AUTH_SECRET=
 AUTH_URL=http://localhost:3000
 RESEND_API_KEY=
-EMAIL_FROM="Party <hello@example.com>"
+# Resend's shared test sender. It delivers ONLY to the address registered on
+# your Resend account. Replace with a verified domain when you have one.
+EMAIL_FROM="Party <onboarding@resend.dev>"
 CRON_SECRET=
 ```
 
@@ -2001,6 +2003,17 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   session: { strategy: 'database' },
   pages: { signIn: '/login', verifyRequest: '/login?sent=1', error: '/login' },
   providers: [
+    // Deliberately the only provider, and deliberately isolated on one line.
+    //
+    // EMAIL_FROM is Resend's shared test sender (onboarding@resend.dev), which
+    // delivers ONLY to the address registered on the Resend account. Real
+    // members therefore cannot receive a sign-in link yet. See the dev escape
+    // hatch below, and README "Known limitation: email".
+    //
+    // The fix is to replace this single line — either with a verified sending
+    // domain, or with Nodemailer against any SMTP mailbox:
+    //   Nodemailer({ server: process.env.EMAIL_SERVER!, from: process.env.EMAIL_FROM! })
+    // Nothing else in the application changes.
     Resend({ from: process.env.EMAIL_FROM!, apiKey: process.env.RESEND_API_KEY! }),
   ],
   callbacks: {
@@ -2136,13 +2149,32 @@ docker compose exec -T db psql -U party -d party -c \
   "insert into users (email, name) values ('you@example.com', 'You') on conflict do nothing"
 ```
 
-Then, with a real `RESEND_API_KEY` in `.env.local`:
-1. Visit `http://localhost:3000` → expect a redirect to `/login`.
-2. Submit `you@example.com` → expect the "check your email" state and an email to arrive.
-3. Click the link → expect to land on `/` signed in.
-4. Sign out, then submit `stranger@example.com` → **expect no email and an error**. This is the gate working; if a stranger receives a link, the `signIn` callback is not doing its job and this must be fixed before continuing.
+Use the email registered on your Resend account for `you@example.com` above. With the shared test sender, Resend delivers to that address and no other.
 
-If you do not have a Resend key yet, set `RESEND_API_KEY` to any non-empty string and read the magic link out of the `verification_tokens` table to complete step 3 — but step 4 must still be verified.
+Then, with `RESEND_API_KEY` set in `.env.local`:
+
+1. Visit `http://localhost:3000/login`.
+2. Submit the seeded address → expect the "check your email" state, and an email to arrive.
+3. Click the link → expect to land on `/` signed in.
+4. Submit `stranger@example.com` → **expect no email, and no new row in `verification_tokens`**:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select identifier, expires from verification_tokens order by expires desc limit 5"
+```
+
+Step 4 is the membership gate, and it is the single most important behaviour in this task. If a stranger gets a link, or a `users` row appears for them, the `signIn` callback is not doing its job — stop and fix it before continuing.
+
+**Dev escape hatch.** To sign in as any *seeded* member without receiving mail — which you will need constantly, since the test sender reaches only one inbox — read the token straight from the database and build the callback URL:
+
+```bash
+docker compose exec -T db psql -U party -d party -t -A -F' ' -c \
+  "select identifier, token from verification_tokens order by expires desc limit 1"
+```
+
+Then visit `http://localhost:3000/api/auth/callback/resend?token=<token>&email=<identifier>`.
+
+This works because the gate is enforced at *request* time, not at delivery time: a token only exists for an address that already passed the `signIn` callback. Reading it out of the database bypasses your inbox, not the membership check.
 
 - [ ] **Step 6: Commit**
 
@@ -2613,11 +2645,14 @@ git commit -m "feat: add idempotent seed for founding member and venues"
 
 ---
 
-### Task 11: Deploy to DigitalOcean
+### Task 11: Deploy to a DigitalOcean Droplet
+
+A single Droplet running Docker Compose: Postgres, the app, and Caddy terminating TLS. No managed database and no domain — Caddy gets a real certificate for an `sslip.io` hostname derived from the Droplet's IP.
 
 **Files:**
-- Create: `.do/app.yaml`, `app/page.tsx` (replace the scaffold placeholder)
-- Modify: `README.md`
+- Create: `Dockerfile`, `.dockerignore`, `docker-compose.prod.yml`, `Caddyfile`
+- Create: `app/page.tsx` (replace the scaffold placeholder)
+- Modify: `next.config.ts`, `README.md`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -2649,106 +2684,301 @@ export default async function HomePage() {
 }
 ```
 
-- [ ] **Step 2: Write the App Platform spec**
+- [ ] **Step 2: Enable standalone output**
 
-Create `.do/app.yaml`, substituting your GitHub org or username for `REPLACE_WITH_YOUR_GITHUB_ORG` in **both** places it appears (the `web` service and the `migrate` job):
+Modify `next.config.ts`:
+
+```ts
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
+  // Emits .next/standalone with only the files the server actually needs,
+  // which keeps the production image around 150MB instead of 1GB.
+  output: 'standalone',
+}
+
+export default nextConfig
+```
+
+- [ ] **Step 3: Write the Dockerfile**
+
+Create `Dockerfile`:
+
+```dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+# lib/db/client.ts throws at import time when DATABASE_URL is unset, and the
+# build imports it transitively through lib/auth.ts. postgres.js does not open
+# a connection on construction, so a syntactically valid dummy is enough — no
+# database is reachable or needed during the build.
+ENV DATABASE_URL=postgres://build:build@127.0.0.1:5432/build
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
+RUN addgroup -S -g 1001 nodejs && adduser -S -u 1001 -G nodejs nextjs
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+Create `.dockerignore`:
+
+```
+node_modules
+.next
+.git
+.env*
+docs
+tests
+drizzle/meta
+```
+
+The `builder` stage is kept as a named target rather than discarded, because migrations need `drizzle-kit` and `tsx` — both devDependencies absent from the slim runner image.
+
+- [ ] **Step 4: Write the production compose file**
+
+Create `docker-compose.prod.yml`:
 
 ```yaml
-name: party
-region: sgp
 services:
-  - name: web
-    github:
-      repo: REPLACE_WITH_YOUR_GITHUB_ORG/party
-      branch: main
-      deploy_on_push: true
-    build_command: npm run build
-    run_command: npm start
-    environment_slug: node-js
-    instance_size_slug: basic-xxs
-    instance_count: 1
-    http_port: 3000
-    envs:
-      - key: DATABASE_URL
-        scope: RUN_AND_BUILD_TIME
-        value: ${db.DATABASE_URL}
-      - key: AUTH_SECRET
-        scope: RUN_AND_BUILD_TIME
-        type: SECRET
-      - key: AUTH_URL
-        scope: RUN_AND_BUILD_TIME
-        value: ${APP_URL}
-      - key: RESEND_API_KEY
-        scope: RUN_AND_BUILD_TIME
-        type: SECRET
-      - key: EMAIL_FROM
-        scope: RUN_AND_BUILD_TIME
-      - key: CRON_SECRET
-        scope: RUN_AND_BUILD_TIME
-        type: SECRET
-      - key: FOUNDER_EMAIL
-        scope: RUN_AND_BUILD_TIME
-      - key: FOUNDER_NAME
-        scope: RUN_AND_BUILD_TIME
-jobs:
-  - name: migrate
-    kind: PRE_DEPLOY
-    github:
-      repo: REPLACE_WITH_YOUR_GITHUB_ORG/party
-      branch: main
-    build_command: npm run build
-    run_command: npm run db:migrate && npm run db:seed
-    environment_slug: node-js
-    instance_size_slug: basic-xxs
-    envs:
-      - key: DATABASE_URL
-        scope: RUN_TIME
-        value: ${db.DATABASE_URL}
-      - key: FOUNDER_EMAIL
-        scope: RUN_TIME
-      - key: FOUNDER_NAME
-        scope: RUN_TIME
-databases:
-  - name: db
-    engine: PG
-    version: "16"
-    production: false
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: party
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: party
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U party"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Deliberately no `ports:` — Postgres is reachable only from the compose
+    # network. A Droplet with an exposed 5432 is found by scanners within hours.
+
+  migrate:
+    build:
+      context: .
+      target: builder
+    env_file: .env.production
+    depends_on:
+      db:
+        condition: service_healthy
+    command: sh -c "npm run db:migrate && npm run db:seed"
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      target: runner
+    env_file: .env.production
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
 ```
 
-`region: sgp` is Singapore — the closest DigitalOcean region to Bali, and the difference in latency to a phone in Canggu is noticeable.
+`migrate` runs to completion before `web` starts, so the schema is never behind the code.
 
-The `PRE_DEPLOY` job runs migrations before the new code goes live, which is why the seed script had to be idempotent: it runs on every single deploy.
+- [ ] **Step 5: Write the Caddyfile**
 
-- [ ] **Step 3: Confirm the production build is clean**
+Create `Caddyfile`:
+
+```
+{$SITE_ADDRESS} {
+	reverse_proxy web:3000
+}
+```
+
+Two lines, and they solve the no-domain problem entirely.
+
+`SITE_ADDRESS` will be a `sslip.io` hostname: `sslip.io` is a public wildcard DNS service that resolves any host of the form `143-198-1-2.sslip.io` to the IP embedded in it. That gives the Droplet a real, publicly-resolvable name at no cost, which is all Let's Encrypt requires — so Caddy provisions and renews a genuine certificate automatically.
+
+This matters more than it looks. Auth.js session cookies carry a live session token; over plain HTTP they travel in clear text on whatever café or club wifi the user is on. A certificate is not optional here just because there is no domain.
+
+- [ ] **Step 6: Create the Droplet**
+
+In the DigitalOcean control panel, or with `doctl`:
 
 ```bash
-npm run lint && npm test && npm run test:integration && npm run build
+doctl compute droplet create party \
+  --region sgp1 \
+  --image ubuntu-24-04-x64 \
+  --size s-1vcpu-2gb \
+  --ssh-keys "$(doctl compute ssh-key list --format ID --no-header | head -1)" \
+  --wait
 ```
 
-Expected: all four succeed. Do not deploy on a red build.
+`sgp1` is Singapore, the closest region to Bali.
 
-- [ ] **Step 4: Deploy**
+**Do not choose the 1GB size.** `next build` routinely exceeds 1GB of resident memory and the OOM killer terminates it with a message that looks nothing like an out-of-memory error. 2GB costs a few dollars more per month and removes an afternoon of confusion.
 
-Push to GitHub, then either create the app from `.do/app.yaml` in the DigitalOcean control panel, or:
+Note the IP address:
 
 ```bash
-doctl apps create --spec .do/app.yaml
+doctl compute droplet get party --format PublicIPv4 --no-header
 ```
 
-Set the secret values (`AUTH_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`, `CRON_SECRET`, `FOUNDER_EMAIL`, `FOUNDER_NAME`) in the control panel. Generate `AUTH_SECRET` with `npx auth secret` — do not reuse the local one.
+- [ ] **Step 7: Provision the Droplet**
 
-- [ ] **Step 5: Verify the deployment against reality**
+SSH in as root and run:
 
-On the live URL:
-1. Visit `/` → redirects to `/login`.
-2. Sign in as `FOUNDER_EMAIL` → the magic link arrives and works.
-3. Visit `/invites` → three codes.
-4. Open a code's join link in a private window, redeem it with a second email → account created, sign-in email arrives.
-5. Try `/login` with an email that has no account → no email is sent.
+```bash
+# Docker with the compose plugin
+curl -fsSL https://get.docker.com | sh
 
-Step 5 is the one that matters most. It is the invite gate, in production, which is the entire premise of the product.
+# 2GB of swap: cheap insurance for the build step and for Postgres under load
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
-- [ ] **Step 6: Document the setup**
+# Only SSH and HTTP(S) reach the internet
+ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+
+# Unattended security updates
+apt-get update && apt-get install -y unattended-upgrades
+```
+
+Verify:
+
+```bash
+docker compose version   # expect v2.x
+free -h                  # expect 2.0Gi swap
+ufw status               # expect 22, 80, 443 only
+```
+
+- [ ] **Step 8: Configure and deploy**
+
+On the Droplet:
+
+```bash
+git clone https://github.com/YOUR_ORG/party.git /opt/party
+cd /opt/party
+```
+
+Create `/opt/party/.env.production`. Substitute the Droplet's IP with dashes in `SITE_ADDRESS` and `AUTH_URL` — an IP of `143.198.1.2` becomes `143-198-1-2.sslip.io`:
+
+```
+POSTGRES_PASSWORD=<generate with: openssl rand -base64 24>
+DATABASE_URL=postgres://party:<same password>@db:5432/party
+
+SITE_ADDRESS=143-198-1-2.sslip.io
+AUTH_URL=https://143-198-1-2.sslip.io
+AUTH_SECRET=<generate with: openssl rand -base64 32>
+# Caddy terminates TLS and proxies over HTTP, so Auth.js must be told to trust
+# the forwarded host rather than inferring http:// and building broken links.
+AUTH_TRUST_HOST=true
+
+RESEND_API_KEY=<your key>
+EMAIL_FROM="Party <onboarding@resend.dev>"
+
+CRON_SECRET=<generate with: openssl rand -base64 32>
+FOUNDER_EMAIL=<the email on your Resend account>
+FOUNDER_NAME=<your name>
+```
+
+`FOUNDER_EMAIL` must be the address registered to your Resend account. With the shared test sender, that is the only address Resend will deliver to — see Task 7.
+
+Set the compose file as the default so later commands are shorter, then bring it up:
+
+```bash
+echo 'COMPOSE_FILE=docker-compose.prod.yml' >> /opt/party/.env
+docker compose up -d --build
+docker compose logs -f migrate
+```
+
+Expected: the migrate container applies migrations, seeds venues and the founder, and exits 0. Then `docker compose ps` shows `db`, `web`, and `caddy` running and `migrate` exited.
+
+- [ ] **Step 9: Verify against reality**
+
+From your laptop, against `https://<dashed-ip>.sslip.io`:
+
+1. The certificate is valid — no browser warning. If Caddy could not issue, check `docker compose logs caddy`; the usual cause is port 80 being blocked, which Let's Encrypt needs for the HTTP challenge.
+2. `/` redirects to `/login`.
+3. Sign in as `FOUNDER_EMAIL` → the email arrives and the link signs you in.
+4. `/invites` shows three codes.
+5. Open a code's join link in a private window and redeem it with a **second** email you control. The account is created, but **no email will arrive** — Resend's test sender only delivers to your own account address. Recover the sign-in link from the logs:
+
+```bash
+docker compose exec db psql -U party -d party \
+  -c "select identifier, token, expires from verification_tokens order by expires desc limit 1"
+```
+
+Then visit `https://<dashed-ip>.sslip.io/api/auth/callback/resend?token=<token>&email=<identifier>`.
+
+6. Request a link for an email with no account → no email, and no user row created. This is the invite gate, and it is the one behaviour that must hold in production.
+
+Step 5 is tedious on purpose: it is the cost of the test sender, and it is exactly what a verified domain or an SMTP mailbox removes. Nothing else in the system needs to change to fix it — see Task 7.
+
+- [ ] **Step 10: Set up backups**
+
+The Droplet holds the only copy of the database. Add a nightly dump:
+
+```bash
+mkdir -p /opt/party/backups
+cat > /etc/cron.daily/party-backup <<'SCRIPT'
+#!/bin/sh
+cd /opt/party || exit 1
+FILE="/opt/party/backups/party-$(date +%F).sql.gz"
+docker compose exec -T db pg_dump -U party party | gzip > "$FILE"
+find /opt/party/backups -name 'party-*.sql.gz' -mtime +14 -delete
+SCRIPT
+chmod +x /etc/cron.daily/party-backup
+```
+
+Run it once by hand and confirm the file is non-empty:
+
+```bash
+/etc/cron.daily/party-backup && ls -lh /opt/party/backups
+```
+
+A backup that has never been produced is not a backup. Also enable weekly Droplet snapshots in the DigitalOcean panel — the dumps live on the same disk they protect against losing.
+
+Redeploying later is:
+
+```bash
+cd /opt/party && git pull && docker compose up -d --build
+```
+
+- [ ] **Step 11: Document the setup**
 
 Replace `README.md`:
 
@@ -2777,6 +3007,33 @@ Integration tests need the `party_test` database:
     docker compose exec -T db psql -U party -d party -c "CREATE DATABASE party_test"
     DATABASE_URL=postgres://party:party@localhost:5433/party_test npm run db:migrate
 
+## Production
+
+A single DigitalOcean Droplet running `docker-compose.prod.yml`: Postgres,
+the Next.js app, and Caddy as a TLS-terminating reverse proxy.
+
+There is no domain. Caddy serves an `sslip.io` hostname derived from the
+Droplet's IP (`143-198-1-2.sslip.io` resolves to `143.198.1.2`), which is a
+real public name, so Let's Encrypt issues and renews a real certificate.
+
+Deploy:
+
+    ssh root@<droplet-ip>
+    cd /opt/party && git pull && docker compose up -d --build
+
+Postgres is not published to the host. Reach it with
+`docker compose exec db psql -U party party`.
+
+### Known limitation: email
+
+`EMAIL_FROM` uses Resend's shared test sender, which only delivers to the
+address registered on the Resend account. Magic links therefore reach the
+founder and nobody else, so real members cannot yet sign themselves in.
+
+Fixing it does not touch application code — replace the provider in
+`lib/auth.ts` with either a verified Resend domain or the Nodemailer provider
+pointed at any SMTP mailbox.
+
 ## Architecture
 
 Business logic lives in `lib/domain/**` as plain TypeScript with no framework
@@ -2791,23 +3048,24 @@ See `docs/superpowers/specs/` for the design and `docs/superpowers/plans/` for
 implementation plans.
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add .do README.md app/page.tsx
-git commit -m "chore: add DigitalOcean app spec and setup documentation"
+git add Dockerfile .dockerignore docker-compose.prod.yml Caddyfile next.config.ts README.md app/page.tsx
+git commit -m "chore: add Droplet deployment with Caddy TLS over sslip.io"
 ```
-
----
 
 ## Definition of done
 
 - [ ] `npm test`, `npm run test:integration`, `npm run lint`, and `npm run build` all pass.
 - [ ] The lint rule has been observed rejecting a framework import from `lib/domain`.
 - [ ] The concurrent-redemption test has been observed failing against a naive check-then-act implementation.
-- [ ] A stranger requesting a magic link receives nothing, verified in production.
+- [ ] A stranger requesting a magic link receives nothing and creates no rows, verified in production.
 - [ ] `npm run db:seed` run twice produces no duplicates.
-- [ ] A real second person has redeemed a real code and signed in.
+- [ ] The production site serves a valid certificate on its `sslip.io` hostname.
+- [ ] A second account has redeemed a real code and signed in — via the token escape hatch, since the test sender cannot reach it.
+
+**Not done, and known:** real members cannot sign themselves in until `EMAIL_FROM` points at a verified domain or an SMTP mailbox. Plan 2 is unblocked by this — listings, requests, and approvals can all be built and tested with seeded accounts — but the product cannot be handed to anyone until it is resolved.
 
 ## What Plan 2 picks up
 
