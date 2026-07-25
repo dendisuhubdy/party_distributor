@@ -120,7 +120,7 @@ services:
       POSTGRES_PASSWORD: party
       POSTGRES_DB: party
     ports:
-      - "5433:5432"
+      - "5435:5432"
     volumes:
       - party-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -133,7 +133,7 @@ volumes:
   party-pgdata:
 ```
 
-Port 5433 is deliberate — it avoids colliding with any PostgreSQL already running on the host's 5432.
+Port 5435 is deliberate. It avoids both a PostgreSQL already running on the host's 5432 and any other project's container on 5433 or 5434 — all three were occupied on the machine this was first run on.
 
 Start it and confirm it is healthy:
 
@@ -149,8 +149,8 @@ Expected: the `db` service shows `healthy`.
 `.env.example` (committed):
 
 ```
-DATABASE_URL=postgres://party:party@localhost:5433/party
-TEST_DATABASE_URL=postgres://party:party@localhost:5433/party_test
+DATABASE_URL=postgres://party:party@localhost:5435/party
+TEST_DATABASE_URL=postgres://party:party@localhost:5435/party_test
 AUTH_SECRET=
 AUTH_URL=http://localhost:3000
 RESEND_API_KEY=
@@ -1660,7 +1660,7 @@ Implements the port against real PostgreSQL and proves the claim race is genuine
 
 ```bash
 docker compose exec -T db psql -U party -d party -c "CREATE DATABASE party_test"
-DATABASE_URL=postgres://party:party@localhost:5433/party_test npm run db:migrate
+DATABASE_URL=postgres://party:party@localhost:5435/party_test npm run db:migrate
 ```
 
 Create `tests/support/db-setup.ts`:
@@ -3013,7 +3013,7 @@ Split club tables with people you'd actually want at your table.
 Integration tests need the `party_test` database:
 
     docker compose exec -T db psql -U party -d party -c "CREATE DATABASE party_test"
-    DATABASE_URL=postgres://party:party@localhost:5433/party_test npm run db:migrate
+    DATABASE_URL=postgres://party:party@localhost:5435/party_test npm run db:migrate
 
 ## Production
 

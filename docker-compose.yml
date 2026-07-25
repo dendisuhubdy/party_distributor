@@ -1,0 +1,19 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: party
+      POSTGRES_PASSWORD: party
+      POSTGRES_DB: party
+    ports:
+      - "5435:5432"
+    volumes:
+      - party-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U party"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  party-pgdata:

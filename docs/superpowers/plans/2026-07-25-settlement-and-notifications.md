@@ -3510,14 +3510,14 @@ E2E gets its own database so a run cannot truncate the integration suite's data 
 
 ```bash
 docker compose exec -T db psql -U party -d party -c "CREATE DATABASE party_e2e"
-E2E_DATABASE_URL=postgres://party:party@localhost:5433/party_e2e
+E2E_DATABASE_URL=postgres://party:party@localhost:5435/party_e2e
 DATABASE_URL=$E2E_DATABASE_URL npm run db:migrate
 ```
 
 Add to `.env.example`:
 
 ```
-E2E_DATABASE_URL=postgres://party:party@localhost:5433/party_e2e
+E2E_DATABASE_URL=postgres://party:party@localhost:5435/party_e2e
 ```
 
 Add to `.gitignore`:
