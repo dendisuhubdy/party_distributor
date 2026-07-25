@@ -2649,6 +2649,14 @@ git commit -m "feat: add idempotent seed for founding member and venues"
 
 A single Droplet running Docker Compose: Postgres, the app, and Caddy terminating TLS. No managed database and no domain — Caddy gets a real certificate for an `sslip.io` hostname derived from the Droplet's IP.
 
+> **Amended after this plan was written.** The project has a domain: **`wazup.party`**, with DNS on Cloudflare. The `sslip.io` hostname below, and the "known limitation: email" that follows from Resend's shared test sender, are both **obsolete**.
+>
+> Execute this task as written anyway — it stands up the Droplet, the Compose stack, the firewall, and the nightly `pg_dump`, none of which change. Then either substitute `wazup.party` for the `sslip.io` hostname as you go, or ship on `sslip.io` first and cut over later; both work, because the only difference is the name in the `Caddyfile` and in `AUTH_URL`.
+>
+> **The authoritative cutover is Plan 3 Task 12** (`docs/superpowers/plans/2026-07-25-settlement-and-notifications.md`), which covers the Cloudflare records and the DNS-only requirement, the `www` redirect, verifying `wazup.party` as a Resend sending domain, and retiring the email limitation from the README and the spec. Read it before writing the `Caddyfile` if you intend to go straight to the real domain.
+>
+> One thing to carry over now regardless: set `AUTH_TRUST_HOST=true`. Auth.js behind Caddy rejects every callback without it, whichever hostname you serve.
+
 **Files:**
 - Create: `Dockerfile`, `.dockerignore`, `docker-compose.prod.yml`, `Caddyfile`
 - Create: `app/page.tsx` (replace the scaffold placeholder)

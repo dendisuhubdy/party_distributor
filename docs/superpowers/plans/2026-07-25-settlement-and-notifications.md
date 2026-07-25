@@ -2690,6 +2690,7 @@ import {
   seatRemovedEmail, seatRequestedEmail,
 } from '@/lib/domain/notify/templates'
 import type { EmailMessage, ListingDigest } from '@/lib/domain/notify/types'
+import type { ListingSummary } from '@/lib/domain/tables/types'
 import { notifyDeps } from '@/lib/notify-service'
 import { seatsDeps } from '@/lib/seats-service'
 import { tablesDeps } from '@/lib/tables-service'
@@ -2697,14 +2698,15 @@ import { tablesDeps } from '@/lib/tables-service'
 const ctx = { baseUrl: notifyDeps.baseUrl }
 
 /**
- * Translate a listing into the flat value `notify` accepts. This function is
- * the boundary the module rule protects: `notify` never imports `tables`, so
+ * Translate a listing into the flat value `notify` accepts. This is the
+ * boundary the module rule protects: `notify` never imports `tables`, so
  * something on this side has to do the conversion.
+ *
+ * Identical to the one in `lib/domain/reminders/send-reminders.ts`. Sharing it
+ * would mean either module reaching across the seam this function exists to
+ * define, so the duplication is deliberate.
  */
-async function digestFor(listingId: string): Promise<ListingDigest | null> {
-  const summary = await tablesDeps.repository.findListingSummary(listingId)
-  if (!summary) return null
-
+function toDigest(summary: ListingSummary): ListingDigest {
   return {
     listingId: summary.listing.id,
     venueName: summary.venue.name,
@@ -2715,6 +2717,11 @@ async function digestFor(listingId: string): Promise<ListingDigest | null> {
     paymentLink: summary.listing.paymentLink,
     paymentNote: summary.listing.paymentNote,
   }
+}
+
+async function digestFor(listingId: string): Promise<ListingDigest | null> {
+  const summary = await tablesDeps.repository.findListingSummary(listingId)
+  return summary ? toDigest(summary) : null
 }
 
 /**
@@ -2741,16 +2748,16 @@ async function send(messages: EmailMessage[], label: string): Promise<void> {
 }
 
 export async function notifyNewListing(listingId: string): Promise<void> {
-  const listing = await digestFor(listingId)
-  if (!listing) return
-
-  const everyone = await notifyDeps.recipients.listActiveRecipients()
   const summary = await tablesDeps.repository.findListingSummary(listingId)
+  if (!summary) return
+
+  const listing = toDigest(summary)
+  const everyone = await notifyDeps.recipients.listActiveRecipients()
 
   const messages = everyone
     // The host already knows. Emailing them their own announcement is the
     // fastest way to make the product feel like a mailing list.
-    .filter((to) => to.userId !== summary?.listing.hostId)
+    .filter((to) => to.userId !== summary.listing.hostId)
     .map((to) => newListingEmail(ctx, { listing, to }))
 
   await send(messages, 'new_listing')
@@ -3243,15 +3250,19 @@ import { dispatch } from '../notify/dispatch'
 import type { NotifyDeps } from '../notify/ports'
 import { eventReminderEmail } from '../notify/templates'
 import type { EmailMessage, ListingDigest } from '../notify/types'
-import type { SeatsRepository } from '../seats/ports'
 import { buildPaymentGrid, totalOutstanding } from '../settlement/derive'
 import type { SettlementRepository } from '../settlement/ports'
 import type { TablesRepository } from '../tables/ports'
 import type { ListingSummary } from '../tables/types'
 
+/**
+ * No `SeatsRepository` here on purpose. Who is on the table comes from the
+ * payment grid, which already carries each request alongside its money — asking
+ * the seats repository as well would query the same rows twice and give two
+ * answers that could disagree.
+ */
 export interface ReminderDeps {
   tables: TablesRepository
-  seats: SeatsRepository
   settlement: SettlementRepository
   notify: NotifyDeps
 }
@@ -3353,13 +3364,11 @@ Create `lib/reminders-service.ts`:
 ```ts
 import type { ReminderDeps } from '@/lib/domain/reminders/send-reminders'
 import { notifyDeps } from '@/lib/notify-service'
-import { seatsDeps } from '@/lib/seats-service'
 import { settlementDeps } from '@/lib/settlement-service'
 import { tablesDeps } from '@/lib/tables-service'
 
 export const reminderDeps: ReminderDeps = {
   tables: tablesDeps.repository,
-  seats: seatsDeps.repository,
   settlement: settlementDeps.repository,
   notify: notifyDeps,
 }
