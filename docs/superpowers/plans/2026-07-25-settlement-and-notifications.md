@@ -2947,3 +2947,532 @@ git push
 ```
 
 ---
+
+### Task 10: The day-before reminder
+
+**Files:**
+- Modify: `lib/domain/event-time.ts`
+- Create: `lib/domain/reminders/send-reminders.ts`, `lib/reminders-service.ts`
+- Create: `app/api/cron/reminders/route.ts`
+- Test: `tests/domain/event-time.test.ts` (extend), `tests/domain/reminders/send-reminders.test.ts`
+
+**Interfaces:**
+- Consumes: `TablesRepository`, `SeatsRepository`, `SettlementRepository`, `NotifyDeps`, `buildPaymentGrid`, `totalOutstanding`, `eventReminderEmail`, `dispatch`.
+- Produces: `baliDayBounds(reference, dayOffset): { from: Date; to: Date }`; `ReminderDeps`; `ReminderSummary`; `sendReminders(deps, now): Promise<ReminderSummary>`; `reminderDeps`; `POST /api/cron/reminders`.
+
+- [ ] **Step 1: Write the failing test for the day window**
+
+Append to `tests/domain/event-time.test.ts`:
+
+```ts
+import { baliDayBounds } from '@/lib/domain/event-time'
+
+describe('baliDayBounds', () => {
+  it('brackets the Bali day the reference instant falls in', () => {
+    // 17:00 UTC on 15 Aug is 01:00 Bali on 16 Aug — the 16th, not the 15th.
+    const { from, to } = baliDayBounds(new Date('2026-08-15T17:00:00Z'))
+
+    expect(from).toEqual(new Date('2026-08-15T16:00:00.000Z')) // 16 Aug 00:00 Bali
+    expect(to).toEqual(new Date('2026-08-16T16:00:00.000Z')) // 17 Aug 00:00 Bali
+  })
+
+  it('brackets tomorrow at an offset of one', () => {
+    // 06:00 UTC on 15 Aug is 14:00 Bali on the 15th, so tomorrow is the 16th.
+    const { from, to } = baliDayBounds(new Date('2026-08-15T06:00:00Z'), 1)
+
+    expect(from).toEqual(new Date('2026-08-15T16:00:00.000Z')) // 16 Aug 00:00 Bali
+    expect(to).toEqual(new Date('2026-08-16T16:00:00.000Z')) // 17 Aug 00:00 Bali
+  })
+
+  it('spans exactly one day', () => {
+    const { from, to } = baliDayBounds(new Date('2026-08-15T06:00:00Z'), 3)
+
+    expect(to.getTime() - from.getTime()).toBe(24 * 60 * 60 * 1000)
+  })
+
+  it('crosses a month boundary', () => {
+    const { from } = baliDayBounds(new Date('2026-08-31T06:00:00Z'), 1)
+
+    expect(from).toEqual(new Date('2026-08-31T16:00:00.000Z')) // 1 Sep 00:00 Bali
+  })
+
+  it('does not shift with the process timezone', () => {
+    // Same assertion as the first test; the TZ=UTC and TZ=New_York runs in
+    // Task 2 Step 5 of Plan 2 are what actually exercise this.
+    expect(baliDayBounds(new Date('2026-08-15T17:00:00Z')).from)
+      .toEqual(new Date('2026-08-15T16:00:00.000Z'))
+  })
+})
+```
+
+- [ ] **Step 2: Implement it**
+
+Append to `lib/domain/event-time.ts`:
+
+```ts
+const MS_PER_DAY = 24 * 60 * 60 * 1000
+
+/**
+ * The half-open instant range `[from, to)` covering one Bali calendar day.
+ *
+ * `dayOffset` counts days from the day `reference` falls in — 1 is tomorrow.
+ * Adding whole days by arithmetic is exact here only because the offset is
+ * fixed: with a DST zone this would need a calendar library.
+ */
+export function baliDayBounds(reference: Date, dayOffset = 0): { from: Date; to: Date } {
+  const asBaliClock = new Date(reference.getTime() + BALI_UTC_OFFSET_HOURS * 60 * 60 * 1000)
+  const baliDay = asBaliClock.toISOString().slice(0, 10)
+
+  const from = new Date(parseBaliDay(baliDay).getTime() + dayOffset * MS_PER_DAY)
+  return { from, to: new Date(from.getTime() + MS_PER_DAY) }
+}
+```
+
+Delete the local `const MS_PER_DAY` from `lib/domain/tables/list-feed.ts` and import it from here instead, or leave both — they are the same value, and duplicating a constant this well-known is not worth a cross-module import. Pick one and be consistent.
+
+- [ ] **Step 3: Run the tests**
+
+```bash
+npm test
+TZ=UTC npm test
+TZ=America/New_York npm test
+```
+
+Expected: identical results from all three.
+
+- [ ] **Step 4: Write the failing tests for the reminder run**
+
+Create `tests/domain/reminders/send-reminders.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { sendReminders } from '@/lib/domain/reminders/send-reminders'
+import { FakePartyRepository } from '../../support/fake-party-repository'
+import { FakeEmailLog, FakeEmailSender, FakeRecipients } from '../../support/fake-notify'
+
+// 14:00 Bali on 15 Aug 2026. Tomorrow is the 16th.
+const NOW = new Date('2026-08-15T06:00:00Z')
+/** 22:00 Bali on 16 Aug. */
+const TOMORROW_NIGHT = new Date('2026-08-16T14:00:00Z')
+/** 22:00 Bali on 18 Aug. */
+const LATER_WEEK = new Date('2026-08-18T14:00:00Z')
+
+let party: FakePartyRepository
+let sender: FakeEmailSender
+let log: FakeEmailLog
+let people: FakeRecipients
+
+let hostId: string
+let guestId: string
+
+const deps = () => ({
+  tables: party,
+  seats: party,
+  settlement: party,
+  notify: { sender, log, recipients: people, now: () => NOW, baseUrl: 'https://wazup.party' },
+})
+
+function member(name: string) {
+  const user = party.seedUser({ name })
+  people.seed({ userId: user.id, email: `${name.toLowerCase()}@example.com`, name })
+  return user.id
+}
+
+beforeEach(() => {
+  party = new FakePartyRepository()
+  sender = new FakeEmailSender()
+  log = new FakeEmailLog()
+  people = new FakeRecipients()
+  hostId = member('Host')
+  guestId = member('Guest')
+})
+
+function tableTomorrow(overrides: { startsAt?: Date; seatsOffered?: number } = {}) {
+  return party.seedListing({
+    hostId,
+    startsAt: overrides.startsAt ?? TOMORROW_NIGHT,
+    seatsOffered: overrides.seatsOffered ?? 4,
+    seatPrice: 2_500_000,
+  })
+}
+
+function approvedGuest(tableId: string, userId: string, paid: 'no' | 'marked' | 'confirmed' = 'no') {
+  const request = party.seedRequest({ tableId, userId, status: 'approved' })
+  const payment = party.seedPayment({ seatRequestId: request.id, amount: 2_500_000 })
+  if (paid !== 'no') payment.markedPaidAt = NOW
+  if (paid === 'confirmed') { payment.confirmedAt = NOW; payment.confirmedBy = hostId }
+  return request
+}
+
+describe('sendReminders', () => {
+  it('emails the host and every approved guest for tomorrow\'s tables', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId)
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary).toMatchObject({ listings: 1, sent: 2, skipped: 0, failed: 0 })
+    expect(sender.sent.map((m) => m.to.name).sort()).toEqual(['Guest', 'Host'])
+    expect(sender.sent.every((m) => m.kind === 'event_reminder')).toBe(true)
+  })
+
+  it('ignores tables that are not tomorrow', async () => {
+    const later = tableTomorrow({ startsAt: LATER_WEEK })
+    approvedGuest(later.id, guestId)
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary.listings).toBe(0)
+    expect(sender.sent).toHaveLength(0)
+  })
+
+  it('ignores cancelled tables', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId)
+    await party.cancelListing(listing.id, hostId, NOW)
+
+    expect((await sendReminders(deps(), NOW)).listings).toBe(0)
+  })
+
+  it('emails the host even when nobody joined', async () => {
+    tableTomorrow()
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary.sent).toBe(1)
+    expect(sender.sent[0].to.name).toBe('Host')
+  })
+
+  it('skips guests who are only pending', async () => {
+    const listing = tableTomorrow()
+    party.seedRequest({ tableId: listing.id, userId: guestId, status: 'pending' })
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary.sent).toBe(1)
+    expect(sender.sent[0].to.name).toBe('Host')
+  })
+
+  it('tells a guest who has not paid what they owe', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId, 'no')
+
+    await sendReminders(deps(), NOW)
+
+    const toGuest = sender.sent.find((m) => m.to.name === 'Guest')!
+    expect(toGuest.text).toContain('Rp 2.500.000')
+  })
+
+  it('tells a confirmed guest they are settled', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId, 'confirmed')
+
+    await sendReminders(deps(), NOW)
+
+    const toGuest = sender.sent.find((m) => m.to.name === 'Guest')!
+    expect(toGuest.text.toLowerCase()).toContain('all settled')
+  })
+
+  it('still chases a guest whose payment the host has not confirmed', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId, 'marked')
+
+    await sendReminders(deps(), NOW)
+
+    const toGuest = sender.sent.find((m) => m.to.name === 'Guest')!
+    expect(toGuest.text).toContain('Rp 2.500.000')
+  })
+
+  it('tells the host how much is still uncollected', async () => {
+    const other = member('Other')
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId, 'confirmed')
+    approvedGuest(listing.id, other, 'no')
+
+    await sendReminders(deps(), NOW)
+
+    const toHost = sender.sent.find((m) => m.to.name === 'Host')!
+    expect(toHost.text).toContain('Rp 2.500.000')
+    expect(toHost.text).toContain('2 guests')
+  })
+
+  it('sends nothing twice, even if the cron fires twice in a day', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId)
+
+    await sendReminders(deps(), NOW)
+    const second = await sendReminders(deps(), NOW)
+
+    expect(second).toMatchObject({ sent: 0, skipped: 2 })
+    expect(sender.sent).toHaveLength(2)
+  })
+
+  it('reports a failed send without throwing', async () => {
+    const listing = tableTomorrow()
+    approvedGuest(listing.id, guestId)
+    sender.failOn = 'guest@example.com'
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary).toMatchObject({ sent: 1, failed: 1 })
+  })
+
+  it('covers several tables in one run', async () => {
+    const a = tableTomorrow()
+    const b = tableTomorrow()
+    approvedGuest(a.id, guestId)
+    approvedGuest(b.id, member('Third'))
+
+    const summary = await sendReminders(deps(), NOW)
+
+    expect(summary.listings).toBe(2)
+    expect(summary.sent).toBe(4)
+  })
+})
+```
+
+The double-fire test is why the reminder is keyed on the listing rather than on the day: `entity_id = listingId` with `kind = 'event_reminder'` means one reminder per person per table, forever, however many times cron runs or is re-run by hand.
+
+- [ ] **Step 5: Implement the reminder run**
+
+Create `lib/domain/reminders/send-reminders.ts`:
+
+```ts
+import { baliDayBounds } from '../event-time'
+import { dispatch } from '../notify/dispatch'
+import type { NotifyDeps } from '../notify/ports'
+import { eventReminderEmail } from '../notify/templates'
+import type { EmailMessage, ListingDigest } from '../notify/types'
+import type { SeatsRepository } from '../seats/ports'
+import { buildPaymentGrid, totalOutstanding } from '../settlement/derive'
+import type { SettlementRepository } from '../settlement/ports'
+import type { TablesRepository } from '../tables/ports'
+import type { ListingSummary } from '../tables/types'
+
+export interface ReminderDeps {
+  tables: TablesRepository
+  seats: SeatsRepository
+  settlement: SettlementRepository
+  notify: NotifyDeps
+}
+
+export interface ReminderSummary {
+  listings: number
+  sent: number
+  skipped: number
+  failed: number
+}
+
+function toDigest(summary: ListingSummary): ListingDigest {
+  return {
+    listingId: summary.listing.id,
+    venueName: summary.venue.name,
+    eventName: summary.listing.eventName,
+    startsAt: summary.listing.startsAt,
+    seatPrice: summary.listing.seatPrice,
+    hostName: summary.host.name,
+    paymentLink: summary.listing.paymentLink,
+    paymentNote: summary.listing.paymentNote,
+  }
+}
+
+/**
+ * Remind everyone about tomorrow's tables, once each.
+ *
+ * The window is tomorrow's Bali calendar day, so a run at any hour of today
+ * covers the same set of tables — a cron that drifts, retries, or runs twice
+ * cannot change which tables are in scope. Idempotency comes from `email_log`
+ * keyed on the listing, so a second run inside the same day sends nothing.
+ *
+ * Known edge: a table starting at exactly 00:00 Bali is excluded, because the
+ * feed query bounds are `startsAt > from`. Nothing in this product starts at
+ * midnight, and widening the bound would need a change to a query four other
+ * screens depend on.
+ */
+export async function sendReminders(deps: ReminderDeps, now: Date): Promise<ReminderSummary> {
+  const { from, to } = baliDayBounds(now, 1)
+  const listings = await deps.tables.listUpcomingListings({ from, to })
+
+  const messages: EmailMessage[] = []
+
+  for (const summary of listings) {
+    const listing = toDigest(summary)
+    const rows = buildPaymentGrid(await deps.settlement.listPaymentsForListing(summary.listing.id))
+    const approved = rows.filter((row) => row.request.status === 'approved')
+
+    const host = await deps.notify.recipients.findRecipient(summary.listing.hostId)
+    if (host) {
+      messages.push(eventReminderEmail({ baseUrl: deps.notify.baseUrl }, {
+        listing,
+        to: host,
+        role: 'host',
+        outstanding: totalOutstanding(rows),
+        approvedSeats: approved.length,
+      }))
+    }
+
+    for (const row of approved) {
+      const guest = await deps.notify.recipients.findRecipient(row.request.userId)
+      if (!guest) continue
+
+      messages.push(eventReminderEmail({ baseUrl: deps.notify.baseUrl }, {
+        listing,
+        to: guest,
+        role: 'guest',
+        // A guest who marked paid but has no host confirmation still owes it as
+        // far as the app can tell — the same reading the host's grid takes.
+        outstanding: row.state === 'confirmed' ? 0 : row.payment.amount,
+        approvedSeats: approved.length,
+      }))
+    }
+  }
+
+  const result = await dispatch(deps.notify, messages)
+
+  return {
+    listings: listings.length,
+    sent: result.sent,
+    skipped: result.skipped,
+    failed: result.failed.length,
+  }
+}
+```
+
+- [ ] **Step 6: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+The lint run is doing real work here: `send-reminders.ts` sits in `lib/domain` and imports from four other domain modules. If it accidentally reaches for `@/lib/db` or a service file, the domain-purity rule fails the build.
+
+- [ ] **Step 7: Wire it and expose the route**
+
+Create `lib/reminders-service.ts`:
+
+```ts
+import type { ReminderDeps } from '@/lib/domain/reminders/send-reminders'
+import { notifyDeps } from '@/lib/notify-service'
+import { seatsDeps } from '@/lib/seats-service'
+import { settlementDeps } from '@/lib/settlement-service'
+import { tablesDeps } from '@/lib/tables-service'
+
+export const reminderDeps: ReminderDeps = {
+  tables: tablesDeps.repository,
+  seats: seatsDeps.repository,
+  settlement: settlementDeps.repository,
+  notify: notifyDeps,
+}
+```
+
+Create `app/api/cron/reminders/route.ts`:
+
+```ts
+import { timingSafeEqual } from 'node:crypto'
+import { NextResponse } from 'next/server'
+import { sendReminders } from '@/lib/domain/reminders/send-reminders'
+import { reminderDeps } from '@/lib/reminders-service'
+
+// Never cached: this route has side effects and must run on every call.
+export const dynamic = 'force-dynamic'
+
+function authorized(request: Request, secret: string): boolean {
+  const provided = request.headers.get('authorization') ?? ''
+  const expected = `Bearer ${secret}`
+
+  // Compare in constant time. The buffers must match in length first, because
+  // timingSafeEqual throws on a length mismatch rather than returning false.
+  const a = Buffer.from(provided)
+  const b = Buffer.from(expected)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+export async function POST(request: Request) {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    return NextResponse.json({ error: 'CRON_SECRET is not set' }, { status: 503 })
+  }
+  if (!authorized(request, secret)) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
+  }
+
+  const summary = await sendReminders(reminderDeps, new Date())
+  return NextResponse.json(summary)
+}
+```
+
+There is no `GET` handler on purpose. A URL that fires email on a plain visit gets triggered by link previews, security scanners, and any crawler that finds it in a log.
+
+- [ ] **Step 8: Verify the route by hand**
+
+```bash
+npm run dev
+```
+
+Set `CRON_SECRET` in `.env.local`, then:
+
+```bash
+# Wrong secret
+curl -i -X POST -H "Authorization: Bearer wrong" http://localhost:3000/api/cron/reminders
+# Expect: 401
+
+# No header at all
+curl -i -X POST http://localhost:3000/api/cron/reminders
+# Expect: 401
+
+# GET
+curl -i http://localhost:3000/api/cron/reminders
+# Expect: 405
+
+# Correct secret
+curl -sS -X POST -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/reminders
+# Expect: {"listings":N,"sent":M,"skipped":0,"failed":0}
+```
+
+Set a table's `starts_at` to tomorrow evening in Bali first, so there is something to remind about:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "update table_listings set starts_at = (current_date + interval '1 day' + interval '22 hours') at time zone 'Asia/Makassar'"
+```
+
+Then call the endpoint twice. The second call must report `sent: 0` with a non-zero `skipped`.
+
+- [ ] **Step 9: Schedule it on the Droplet**
+
+Plan 1 Task 11 already installs a nightly `pg_dump`. Add the reminder next to it. On the Droplet:
+
+```bash
+cat >/etc/cron.d/party-reminders <<'CRON'
+# Day-before reminders. 10:00 UTC is 18:00 in Bali — late enough that a host
+# has seen the day's requests, early enough to still chase a payment.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 10 * * * root . /opt/party/.env.cron && curl -fsS --max-time 120 -X POST -H "Authorization: Bearer $CRON_SECRET" https://wazup.party/api/cron/reminders >>/var/log/party-reminders.log 2>&1
+CRON
+chmod 0644 /etc/cron.d/party-reminders
+
+# The secret, kept out of the crontab so `ps` and the file mode do not leak it.
+printf 'CRON_SECRET=%s\n' "$(grep '^CRON_SECRET=' /opt/party/.env | cut -d= -f2-)" >/opt/party/.env.cron
+chmod 0600 /opt/party/.env.cron
+```
+
+Verify it will run, then force one run now:
+
+```bash
+systemctl status cron --no-pager
+run-parts --test /etc/cron.daily >/dev/null; echo "cron is alive"
+. /opt/party/.env.cron && curl -sS -X POST -H "Authorization: Bearer $CRON_SECRET" https://wazup.party/api/cron/reminders
+```
+
+A `/etc/cron.d` file needs the trailing newline the heredoc provides and a username field (`root`) that a user crontab does not have. Both are easy to get wrong, and cron fails silently when they are.
+
+- [ ] **Step 10: Commit and push**
+
+```bash
+git add lib/domain/event-time.ts lib/domain/reminders lib/reminders-service.ts app/api/cron tests/domain
+git commit -m "feat: add the day-before reminder and its cron endpoint"
+git push
+```
+
+---
