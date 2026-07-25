@@ -2610,3 +2610,539 @@ git push
 ```
 
 ---
+
+### Task 8: PostgreSQL tables repository
+
+**Files:**
+- Create: `lib/db/repositories/tables.ts`
+- Modify: `tests/support/db-helpers.ts`
+- Test: `tests/integration/tables-repository.test.ts`
+
+**Interfaces:**
+- Consumes: `TablesRepository` and its types (Task 1); `db` and schema (Plan 1 Task 3).
+- Produces: `class PostgresTablesRepository implements TablesRepository`, constructed as `new PostgresTablesRepository(db)`; `SUMMARY_COLUMNS` and `toSummary`, reused by the seats repository in Task 9.
+
+- [ ] **Step 1: Extend the database test helpers**
+
+Add to `tests/support/db-helpers.ts`:
+
+```ts
+import { seatRequests, tableListings, venues } from '@/lib/db/schema'
+import type { SeatRequestStatus } from '@/lib/domain/seats/types'
+
+export async function seedVenue(overrides: Partial<{ name: string; city: string }> = {}) {
+  const [venue] = await db.insert(venues).values({
+    name: overrides.name ?? `Venue ${crypto.randomUUID().slice(0, 8)}`,
+    city: overrides.city ?? 'Bali',
+  }).returning()
+  return venue
+}
+
+export async function seedListing(input: {
+  hostId: string
+  venueId: string
+  startsAt?: Date
+  seatsOffered?: number
+  seatPrice?: number
+  status?: 'open' | 'cancelled'
+}) {
+  const [listing] = await db.insert(tableListings).values({
+    hostId: input.hostId,
+    venueId: input.venueId,
+    startsAt: input.startsAt ?? new Date('2099-01-01T14:00:00Z'),
+    seatsOffered: input.seatsOffered ?? 4,
+    seatPrice: input.seatPrice ?? 2_500_000,
+    status: input.status ?? 'open',
+  }).returning()
+  return listing
+}
+
+export async function seedRequest(input: {
+  tableId: string
+  hostId: string
+  userId: string
+  status?: SeatRequestStatus
+}) {
+  // hostId is required and must match the listing's host — the composite foreign
+  // key `seat_requests_table_host_fk` rejects any other value.
+  const [request] = await db.insert(seatRequests).values({
+    tableId: input.tableId,
+    hostId: input.hostId,
+    userId: input.userId,
+    status: input.status ?? 'pending',
+  }).returning()
+  return request
+}
+```
+
+- [ ] **Step 2: Write the failing integration tests**
+
+Create `tests/integration/tables-repository.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { eq } from 'drizzle-orm'
+import { db } from '@/lib/db/client'
+import { seatRequests } from '@/lib/db/schema'
+import { PostgresTablesRepository } from '@/lib/db/repositories/tables'
+import { seedListing, seedRequest, seedUser, seedVenue, truncateAll } from '../support/db-helpers'
+
+const repository = new PostgresTablesRepository(db)
+
+let hostId: string
+let guestId: string
+let venueId: string
+
+beforeEach(async () => {
+  await truncateAll()
+  hostId = (await seedUser({ email: 'host@example.com', name: 'Host' })).id
+  guestId = (await seedUser({ email: 'guest@example.com', name: 'Guest' })).id
+  venueId = (await seedVenue({ name: 'Savaya', city: 'Bali' })).id
+})
+
+describe('venues', () => {
+  it('lists venues alphabetically', async () => {
+    await seedVenue({ name: 'Atlas' })
+
+    expect((await repository.listVenues()).map((v) => v.name)).toEqual(['Atlas', 'Savaya'])
+  })
+
+  it('matches a venue name case-insensitively so duplicates are not created', async () => {
+    expect(await repository.findVenueByName('  savaya ')).toMatchObject({ id: venueId })
+    expect(await repository.findVenueByName('Atlas')).toBeNull()
+  })
+
+  it('creates a venue attributed to the member who added it', async () => {
+    const venue = await repository.createVenue({ name: 'Atlas', city: 'Bali', createdBy: hostId })
+
+    expect(venue.name).toBe('Atlas')
+    expect(await repository.findVenueById(venue.id)).toMatchObject({ name: 'Atlas' })
+  })
+})
+
+describe('listings', () => {
+  it('round-trips a listing including money and timestamps', async () => {
+    const created = await repository.insertListing({
+      hostId, venueId,
+      eventName: 'Peggy Gou',
+      startsAt: new Date('2099-08-15T14:00:00.000Z'),
+      seatsOffered: 6,
+      seatPrice: 2_500_000,
+      tableTotal: 25_000_000,
+      notes: 'Table 12',
+      paymentLink: 'https://pay.example/x',
+      paymentNote: 'GoPay',
+    })
+
+    const found = await repository.findListingById(created.id)
+
+    expect(found).toMatchObject({
+      hostId, venueId, eventName: 'Peggy Gou', seatsOffered: 6,
+      seatPrice: 2_500_000, tableTotal: 25_000_000, status: 'open', cancelledAt: null,
+    })
+    expect(found!.startsAt).toEqual(new Date('2099-08-15T14:00:00.000Z'))
+    expect(typeof found!.seatPrice).toBe('number')
+  })
+
+  it('stores a large table total without losing precision', async () => {
+    // 25,000,000 IDR in sen would overflow int4. This is why the column is bigint
+    // and the unit is the rupiah.
+    const created = await repository.insertListing({
+      hostId, venueId, eventName: null, startsAt: new Date('2099-01-01T14:00:00Z'),
+      seatsOffered: 1, seatPrice: 9_007_199_254_740_991, tableTotal: null,
+      notes: null, paymentLink: null, paymentNote: null,
+    })
+
+    expect((await repository.findListingById(created.id))!.seatPrice).toBe(9_007_199_254_740_991)
+  })
+
+  it('returns null for a listing that does not exist', async () => {
+    expect(await repository.findListingById('00000000-0000-0000-0000-000000000000')).toBeNull()
+  })
+
+  it('summarises a listing with its venue, host, and approved count in one call', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    await seedRequest({ tableId: listing.id, hostId, userId: guestId, status: 'approved' })
+
+    const summary = await repository.findListingSummary(listing.id)
+
+    expect(summary!.venue.name).toBe('Savaya')
+    expect(summary!.host).toMatchObject({ id: hostId, name: 'Host' })
+    expect(summary!.approvedSeats).toBe(1)
+  })
+
+  it('counts only approved requests toward the seat count', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    for (const status of ['pending', 'declined', 'withdrawn', 'removed'] as const) {
+      const user = await seedUser({ email: `${status}@example.com`, name: status })
+      await seedRequest({ tableId: listing.id, hostId, userId: user.id, status })
+    }
+
+    expect(await repository.countApprovedSeats(listing.id)).toBe(0)
+  })
+
+  it('updates only the fields present in the patch', async () => {
+    const listing = await seedListing({ hostId, venueId, seatsOffered: 4 })
+
+    const updated = await repository.updateListing(listing.id, { notes: 'Table 12', seatsOffered: 6 })
+
+    expect(updated.notes).toBe('Table 12')
+    expect(updated.seatsOffered).toBe(6)
+    expect(updated.seatPrice).toBe(listing.seatPrice)
+  })
+
+  it('clears a field set to null in the patch', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    await repository.updateListing(listing.id, { notes: 'Something' })
+
+    expect((await repository.updateListing(listing.id, { notes: null })).notes).toBeNull()
+  })
+
+  it('returns the listing unchanged when the patch is empty', async () => {
+    const listing = await seedListing({ hostId, venueId })
+
+    expect(await repository.updateListing(listing.id, {})).toMatchObject({ id: listing.id })
+  })
+})
+
+describe('the feed query', () => {
+  it('returns open upcoming listings soonest first', async () => {
+    const later = await seedListing({ hostId, venueId, startsAt: new Date('2099-03-01T14:00:00Z') })
+    const sooner = await seedListing({ hostId, venueId, startsAt: new Date('2099-02-01T14:00:00Z') })
+
+    const feed = await repository.listUpcomingListings({ from: new Date('2026-01-01T00:00:00Z') })
+
+    expect(feed.map((s) => s.listing.id)).toEqual([sooner.id, later.id])
+  })
+
+  it('excludes listings before the from bound', async () => {
+    await seedListing({ hostId, venueId, startsAt: new Date('2099-02-01T14:00:00Z') })
+
+    const feed = await repository.listUpcomingListings({ from: new Date('2099-06-01T00:00:00Z') })
+
+    expect(feed).toHaveLength(0)
+  })
+
+  it('excludes listings at or after the to bound', async () => {
+    await seedListing({ hostId, venueId, startsAt: new Date('2099-02-01T14:00:00Z') })
+
+    const feed = await repository.listUpcomingListings({
+      from: new Date('2026-01-01T00:00:00Z'), to: new Date('2099-02-01T14:00:00Z'),
+    })
+
+    expect(feed).toHaveLength(0)
+  })
+
+  it('excludes cancelled listings', async () => {
+    await seedListing({ hostId, venueId, status: 'cancelled' })
+
+    expect(await repository.listUpcomingListings({ from: new Date('2026-01-01T00:00:00Z') })).toHaveLength(0)
+  })
+
+  it('filters by venue', async () => {
+    const other = await seedVenue({ name: 'Miss Fish' })
+    await seedListing({ hostId, venueId })
+    await seedListing({ hostId, venueId: other.id })
+
+    const feed = await repository.listUpcomingListings({ from: new Date('2026-01-01T00:00:00Z'), venueId: other.id })
+
+    expect(feed).toHaveLength(1)
+    expect(feed[0].venue.name).toBe('Miss Fish')
+  })
+
+  it('lists what a member hosts, newest event first, including past and cancelled ones', async () => {
+    const past = await seedListing({ hostId, venueId, startsAt: new Date('2020-01-01T14:00:00Z') })
+    const future = await seedListing({ hostId, venueId, startsAt: new Date('2099-01-01T14:00:00Z') })
+    await seedListing({ hostId: guestId, venueId })
+
+    const hosted = await repository.listListingsHostedBy(hostId)
+
+    expect(hosted.map((s) => s.listing.id)).toEqual([future.id, past.id])
+  })
+})
+
+describe('cancelListing', () => {
+  it('cancels the listing and settles every live request in one call', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    const approvedUser = await seedUser({ email: 'approved@example.com', name: 'Approved' })
+    const pendingUser = await seedUser({ email: 'pending@example.com', name: 'Pending' })
+    const goneUser = await seedUser({ email: 'gone@example.com', name: 'Gone' })
+    await seedRequest({ tableId: listing.id, hostId, userId: approvedUser.id, status: 'approved' })
+    await seedRequest({ tableId: listing.id, hostId, userId: pendingUser.id, status: 'pending' })
+    await seedRequest({ tableId: listing.id, hostId, userId: goneUser.id, status: 'withdrawn' })
+
+    const at = new Date('2026-08-01T12:00:00.000Z')
+    const result = await repository.cancelListing(listing.id, hostId, at)
+
+    expect(result.listing.status).toBe('cancelled')
+    expect(result.listing.cancelledAt).toEqual(at)
+    expect(result.removedUserIds).toEqual([approvedUser.id])
+    expect(result.declinedUserIds).toEqual([pendingUser.id])
+
+    const rows = await db.select().from(seatRequests).where(eq(seatRequests.tableId, listing.id))
+    const byUser = Object.fromEntries(rows.map((r) => [r.userId, r.status]))
+    expect(byUser[approvedUser.id]).toBe('removed')
+    expect(byUser[pendingUser.id]).toBe('declined')
+    expect(byUser[goneUser.id]).toBe('withdrawn')
+  })
+
+  it('records who cancelled on every affected request', async () => {
+    const listing = await seedListing({ hostId, venueId })
+    await seedRequest({ tableId: listing.id, hostId, userId: guestId, status: 'approved' })
+
+    await repository.cancelListing(listing.id, hostId, new Date('2026-08-01T12:00:00.000Z'))
+
+    const [row] = await db.select().from(seatRequests).where(eq(seatRequests.tableId, listing.id))
+    expect(row.decidedBy).toBe(hostId)
+    expect(row.decidedAt).toEqual(new Date('2026-08-01T12:00:00.000Z'))
+  })
+
+  it('frees a person to request a seat again after cancellation', async () => {
+    // The partial unique index only covers pending and approved. If the cascade
+    // left a request in either state, this insert would violate it.
+    const listing = await seedListing({ hostId, venueId })
+    await seedRequest({ tableId: listing.id, hostId, userId: guestId, status: 'pending' })
+
+    await repository.cancelListing(listing.id, hostId, new Date())
+
+    await expect(seedRequest({ tableId: listing.id, hostId, userId: guestId, status: 'pending' }))
+      .resolves.toMatchObject({ userId: guestId })
+  })
+})
+```
+
+- [ ] **Step 3: Run the tests and confirm they fail**
+
+```bash
+npm run test:integration
+```
+
+Expected: failure resolving `@/lib/db/repositories/tables`.
+
+- [ ] **Step 4: Implement the repository**
+
+Create `lib/db/repositories/tables.ts`:
+
+```ts
+import { and, asc, desc, eq, gt, lt, sql } from 'drizzle-orm'
+import type { Db } from '../client'
+import { seatRequests, tableListings, users, venues } from '../schema'
+import type {
+  CancelCascade, FeedRange, ListingPatch, NewListing, TablesRepository,
+} from '@/lib/domain/tables/ports'
+import type { ListingSummary, TableListing, Venue } from '@/lib/domain/tables/types'
+
+type ListingRow = typeof tableListings.$inferSelect
+type VenueRow = typeof venues.$inferSelect
+
+function toVenue(row: VenueRow): Venue {
+  return { id: row.id, name: row.name, city: row.city }
+}
+
+function toListing(row: ListingRow): TableListing {
+  return {
+    id: row.id,
+    hostId: row.hostId,
+    venueId: row.venueId,
+    eventName: row.eventName,
+    startsAt: row.startsAt,
+    seatsOffered: row.seatsOffered,
+    seatPrice: row.seatPrice,
+    tableTotal: row.tableTotal,
+    notes: row.notes,
+    paymentLink: row.paymentLink,
+    paymentNote: row.paymentNote,
+    status: row.status,
+    cancelledAt: row.cancelledAt,
+    createdAt: row.createdAt,
+  }
+}
+
+/**
+ * A correlated subquery rather than a join with GROUP BY. It keeps every
+ * summary query a plain row-per-listing select, which means no risk of a join
+ * silently multiplying rows, and it stays correct when a listing has no
+ * requests at all.
+ */
+const approvedSeatsSql = sql<number>`(
+  select count(*) from ${seatRequests}
+  where ${seatRequests.tableId} = ${tableListings.id}
+    and ${seatRequests.status} = 'approved'
+)`.mapWith(Number)
+
+/** Shared so the seats repository can build the same summary shape in Task 9. */
+export const SUMMARY_COLUMNS = {
+  listing: tableListings,
+  venue: venues,
+  hostId: users.id,
+  hostName: users.name,
+  hostInstagram: users.instagramHandle,
+  approvedSeats: approvedSeatsSql,
+}
+
+export interface SummaryRow {
+  listing: ListingRow
+  venue: VenueRow
+  hostId: string
+  hostName: string
+  hostInstagram: string | null
+  approvedSeats: number
+}
+
+export function toSummary(row: SummaryRow): ListingSummary {
+  return {
+    listing: toListing(row.listing),
+    venue: toVenue(row.venue),
+    host: { id: row.hostId, name: row.hostName, instagramHandle: row.hostInstagram },
+    approvedSeats: row.approvedSeats,
+  }
+}
+
+export class PostgresTablesRepository implements TablesRepository {
+  constructor(private readonly db: Db) {}
+
+  async listVenues(): Promise<Venue[]> {
+    const rows = await this.db.select().from(venues).orderBy(asc(venues.name))
+    return rows.map(toVenue)
+  }
+
+  async findVenueById(venueId: string): Promise<Venue | null> {
+    const [row] = await this.db.select().from(venues).where(eq(venues.id, venueId)).limit(1)
+    return row ? toVenue(row) : null
+  }
+
+  async findVenueByName(name: string): Promise<Venue | null> {
+    const [row] = await this.db.select().from(venues)
+      .where(eq(sql`lower(btrim(${venues.name}))`, name.trim().toLowerCase()))
+      .limit(1)
+    return row ? toVenue(row) : null
+  }
+
+  async createVenue(input: { name: string; city: string; createdBy: string }): Promise<Venue> {
+    const [row] = await this.db.insert(venues).values(input).returning()
+    return toVenue(row)
+  }
+
+  async insertListing(listing: NewListing): Promise<TableListing> {
+    const [row] = await this.db.insert(tableListings).values(listing).returning()
+    return toListing(row)
+  }
+
+  async findListingById(listingId: string): Promise<TableListing | null> {
+    const [row] = await this.db.select().from(tableListings)
+      .where(eq(tableListings.id, listingId)).limit(1)
+    return row ? toListing(row) : null
+  }
+
+  async findListingSummary(listingId: string): Promise<ListingSummary | null> {
+    const [row] = await this.db.select(SUMMARY_COLUMNS)
+      .from(tableListings)
+      .innerJoin(venues, eq(venues.id, tableListings.venueId))
+      .innerJoin(users, eq(users.id, tableListings.hostId))
+      .where(eq(tableListings.id, listingId))
+      .limit(1)
+    return row ? toSummary(row) : null
+  }
+
+  async listUpcomingListings(range: FeedRange): Promise<ListingSummary[]> {
+    const conditions = [
+      eq(tableListings.status, 'open'),
+      gt(tableListings.startsAt, range.from),
+    ]
+    if (range.to) conditions.push(lt(tableListings.startsAt, range.to))
+    if (range.venueId) conditions.push(eq(tableListings.venueId, range.venueId))
+
+    const rows = await this.db.select(SUMMARY_COLUMNS)
+      .from(tableListings)
+      .innerJoin(venues, eq(venues.id, tableListings.venueId))
+      .innerJoin(users, eq(users.id, tableListings.hostId))
+      .where(and(...conditions))
+      .orderBy(asc(tableListings.startsAt))
+
+    return rows.map(toSummary)
+  }
+
+  async listListingsHostedBy(userId: string): Promise<ListingSummary[]> {
+    const rows = await this.db.select(SUMMARY_COLUMNS)
+      .from(tableListings)
+      .innerJoin(venues, eq(venues.id, tableListings.venueId))
+      .innerJoin(users, eq(users.id, tableListings.hostId))
+      .where(eq(tableListings.hostId, userId))
+      .orderBy(desc(tableListings.startsAt))
+
+    return rows.map(toSummary)
+  }
+
+  async countApprovedSeats(listingId: string): Promise<number> {
+    const [row] = await this.db.select({ approved: sql<number>`count(*)`.mapWith(Number) })
+      .from(seatRequests)
+      .where(and(eq(seatRequests.tableId, listingId), eq(seatRequests.status, 'approved')))
+    return row?.approved ?? 0
+  }
+
+  async updateListing(listingId: string, patch: ListingPatch): Promise<TableListing> {
+    // Drizzle rejects an empty SET clause, and an edit that changed nothing is a
+    // normal outcome — the host may have resubmitted the form unchanged.
+    const values = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    )
+    if (Object.keys(values).length === 0) {
+      const listing = await this.findListingById(listingId)
+      if (!listing) throw new Error(`listing ${listingId} disappeared during update`)
+      return listing
+    }
+
+    const [row] = await this.db.update(tableListings).set(values)
+      .where(eq(tableListings.id, listingId)).returning()
+    return toListing(row)
+  }
+
+  async cancelListing(listingId: string, byUserId: string, at: Date): Promise<CancelCascade> {
+    return this.db.transaction(async (tx) => {
+      const [listing] = await tx.update(tableListings)
+        .set({ status: 'cancelled', cancelledAt: at })
+        .where(eq(tableListings.id, listingId))
+        .returning()
+
+      const removed = await tx.update(seatRequests)
+        .set({ status: 'removed', decidedAt: at, decidedBy: byUserId })
+        .where(and(eq(seatRequests.tableId, listingId), eq(seatRequests.status, 'approved')))
+        .returning({ userId: seatRequests.userId })
+
+      // Pending requests are declined rather than left alone. A pending row
+      // against a dead table would sit on the partial unique index forever,
+      // blocking that person from asking again if the host relists.
+      const declined = await tx.update(seatRequests)
+        .set({ status: 'declined', decidedAt: at, decidedBy: byUserId })
+        .where(and(eq(seatRequests.tableId, listingId), eq(seatRequests.status, 'pending')))
+        .returning({ userId: seatRequests.userId })
+
+      return {
+        listing: toListing(listing),
+        removedUserIds: removed.map((r) => r.userId),
+        declinedUserIds: declined.map((r) => r.userId),
+      }
+    })
+  }
+}
+```
+
+- [ ] **Step 5: Run the integration tests**
+
+```bash
+npm run test:integration
+```
+
+Expected: every tables-repository test passes.
+
+If the `seatPrice` round-trip returns a string rather than a number, the `bigint` column is missing `{ mode: 'number' }` in `lib/db/schema/table-listings.ts`. Fix it there, not with a cast here — a cast at the boundary would leave every other reader of that column wrong.
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add lib/db/repositories/tables.ts tests/integration/tables-repository.test.ts tests/support/db-helpers.ts
+git commit -m "feat: add Postgres tables repository with cancellation cascade"
+git push
+```
+
+---
