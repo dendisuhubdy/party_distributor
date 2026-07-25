@@ -4162,3 +4162,804 @@ git push
 ```
 
 ---
+
+### Task 12: Listing detail and requesting a seat
+
+**Files:**
+- Create: `app/tables/[id]/page.tsx`, `app/tables/[id]/seat-forms.tsx`, `app/tables/[id]/actions.ts`
+
+**Interfaces:**
+- Consumes: `requestSeat`, `withdrawSeat` (Task 6); `deriveSummaryState` (Task 3); `seatsDeps`, `tablesDeps`, `requireUserId` (Task 10).
+- Produces: `requestSeatAction(prev, formData)`, `withdrawSeatAction(prev, formData)`; `interface SeatActionState { error?: string }`.
+
+- [ ] **Step 1: Write the server actions**
+
+Create `app/tables/[id]/actions.ts`:
+
+```ts
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { isDomainError } from '@/lib/domain/errors'
+import { requestSeat, withdrawSeat } from '@/lib/domain/seats/request-seat'
+import { seatsDeps } from '@/lib/seats-service'
+import { requireUserId } from '@/lib/session'
+
+export interface SeatActionState {
+  error?: string
+}
+
+function revalidateListing(listingId: string): void {
+  revalidatePath(`/tables/${listingId}`)
+  revalidatePath(`/tables/${listingId}/manage`)
+  // The feed shows spots-left, and /me shows the seats this person holds.
+  revalidatePath('/')
+  revalidatePath('/me')
+}
+
+export async function requestSeatAction(
+  _prev: SeatActionState,
+  formData: FormData,
+): Promise<SeatActionState> {
+  const userId = await requireUserId()
+  const listingId = String(formData.get('listingId') ?? '')
+
+  try {
+    await requestSeat(seatsDeps, {
+      listingId,
+      userId,
+      message: String(formData.get('message') ?? '') || null,
+    })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+
+export async function withdrawSeatAction(
+  _prev: SeatActionState,
+  formData: FormData,
+): Promise<SeatActionState> {
+  const userId = await requireUserId()
+  const listingId = String(formData.get('listingId') ?? '')
+
+  try {
+    await withdrawSeat(seatsDeps, { requestId: String(formData.get('requestId') ?? ''), userId })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+```
+
+- [ ] **Step 2: Build the guest-facing forms**
+
+Create `app/tables/[id]/seat-forms.tsx`:
+
+```tsx
+'use client'
+
+import { useActionState } from 'react'
+import { requestSeatAction, withdrawSeatAction, type SeatActionState } from './actions'
+
+const primaryClass =
+  'w-full rounded-lg bg-neutral-900 px-4 py-3 text-base font-medium text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900'
+const secondaryClass =
+  'w-full rounded-lg border border-neutral-300 px-4 py-3 text-base disabled:opacity-50 dark:border-neutral-700'
+
+function ErrorMessage({ state }: { state: SeatActionState }) {
+  if (!state.error) return null
+  return (
+    <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+      {state.error}
+    </p>
+  )
+}
+
+export function RequestSeatForm({ listingId }: { listingId: string }) {
+  const [state, formAction, pending] = useActionState<SeatActionState, FormData>(requestSeatAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col gap-3">
+      <input type="hidden" name="listingId" value={listingId} />
+      <textarea
+        name="message" rows={2} maxLength={280}
+        placeholder="Anything the host should know? (optional)"
+        className="w-full rounded-lg border border-neutral-300 px-4 py-3 text-base dark:border-neutral-700 dark:bg-neutral-950"
+      />
+      <ErrorMessage state={state} />
+      <button type="submit" disabled={pending} className={primaryClass}>
+        {pending ? 'Asking…' : 'Ask for a seat'}
+      </button>
+    </form>
+  )
+}
+
+export function WithdrawSeatForm({ listingId, requestId }: { listingId: string; requestId: string }) {
+  const [state, formAction, pending] = useActionState<SeatActionState, FormData>(withdrawSeatAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col gap-3">
+      <input type="hidden" name="listingId" value={listingId} />
+      <input type="hidden" name="requestId" value={requestId} />
+      <ErrorMessage state={state} />
+      <button type="submit" disabled={pending} className={secondaryClass}>
+        {pending ? 'Withdrawing…' : 'Withdraw'}
+      </button>
+    </form>
+  )
+}
+```
+
+- [ ] **Step 3: Build the detail page**
+
+Create `app/tables/[id]/page.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { notFound } from 'next/navigation'
+import { formatEventTime } from '@/lib/domain/event-time'
+import { formatRupiah } from '@/lib/domain/money'
+import { deriveSummaryState } from '@/lib/domain/tables/derive'
+import { seatsDeps } from '@/lib/seats-service'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+import { RequestSeatForm, WithdrawSeatForm } from './seat-forms'
+
+export default async function ListingPage({ params }: { params: Promise<{ id: string }> }) {
+  const userId = await requireUserId()
+  const { id } = await params
+
+  const summary = await tablesDeps.repository.findListingSummary(id)
+  if (!summary) notFound()
+
+  const { listing, venue, host } = summary
+  const state = deriveSummaryState(summary, new Date())
+  const roster = await seatsDeps.repository.listRequestsForListing(listing.id)
+
+  const approved = roster.filter((entry) => entry.request.status === 'approved')
+  const mine = roster.find(
+    (entry) => entry.request.userId === userId
+      && (entry.request.status === 'pending' || entry.request.status === 'approved'),
+  )
+  const isHost = listing.hostId === userId
+
+  return (
+    <main className="mx-auto max-w-lg px-6 py-8">
+      <h1 className="text-2xl font-semibold">{venue.name}</h1>
+      {listing.eventName && <p className="mt-1 text-neutral-500">{listing.eventName}</p>}
+
+      <dl className="mt-6 flex flex-col gap-2 text-sm">
+        <div className="flex justify-between gap-4">
+          <dt className="text-neutral-500">When</dt>
+          <dd>{formatEventTime(listing.startsAt)}</dd>
+        </div>
+        <div className="flex justify-between gap-4">
+          <dt className="text-neutral-500">Per seat</dt>
+          <dd className="font-medium">{formatRupiah(listing.seatPrice)}</dd>
+        </div>
+        <div className="flex justify-between gap-4">
+          <dt className="text-neutral-500">Spots</dt>
+          <dd>
+            {state.isFull ? 'Full' : `${state.spotsLeft} of ${listing.seatsOffered} left`}
+          </dd>
+        </div>
+        <div className="flex justify-between gap-4">
+          <dt className="text-neutral-500">Host</dt>
+          <dd>
+            {host.name}
+            {host.instagramHandle && <span className="text-neutral-500"> · {host.instagramHandle}</span>}
+          </dd>
+        </div>
+        {listing.tableTotal !== null && (
+          <div className="flex justify-between gap-4">
+            <dt className="text-neutral-500">Table total</dt>
+            <dd className="text-neutral-500">{formatRupiah(listing.tableTotal)}</dd>
+          </div>
+        )}
+      </dl>
+
+      {listing.notes && (
+        <p className="mt-6 whitespace-pre-wrap rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+          {listing.notes}
+        </p>
+      )}
+
+      <section className="mt-8">
+        <h2 className="text-sm font-medium text-neutral-500">
+          At the table ({approved.length})
+        </h2>
+        <ul className="mt-2 flex flex-col gap-1 text-sm">
+          {approved.map((entry) => (
+            <li key={entry.request.id}>
+              {entry.user.name}
+              {entry.user.instagramHandle && (
+                <span className="text-neutral-500"> · {entry.user.instagramHandle}</span>
+              )}
+            </li>
+          ))}
+          {approved.length === 0 && <li className="text-neutral-500">Nobody yet.</li>}
+        </ul>
+      </section>
+
+      <section className="mt-8">
+        {isHost ? (
+          <Link
+            href={`/tables/${listing.id}/manage`}
+            className="block rounded-lg border border-neutral-300 px-4 py-3 text-center text-base dark:border-neutral-700"
+          >
+            Manage this table
+          </Link>
+        ) : state.isCancelled ? (
+          <p className="rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+            This table was cancelled.
+          </p>
+        ) : state.isPast ? (
+          <p className="rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+            This table has already happened.
+          </p>
+        ) : mine?.request.status === 'approved' ? (
+          <div className="flex flex-col gap-3">
+            <p className="rounded-lg bg-emerald-50 p-4 text-sm text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">
+              You&apos;re in. {formatRupiah(listing.seatPrice)} to {host.name}.
+              {listing.paymentNote && <> {listing.paymentNote}</>}
+            </p>
+            {listing.paymentLink && (
+              <a
+                href={listing.paymentLink}
+                rel="noopener noreferrer nofollow"
+                target="_blank"
+                className="block rounded-lg bg-neutral-900 px-4 py-3 text-center text-base font-medium text-white dark:bg-white dark:text-neutral-900"
+              >
+                Pay the host
+              </a>
+            )}
+            <WithdrawSeatForm listingId={listing.id} requestId={mine.request.id} />
+          </div>
+        ) : mine?.request.status === 'pending' ? (
+          <div className="flex flex-col gap-3">
+            <p className="rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+              You&apos;ve asked for a seat. {host.name} will decide.
+            </p>
+            <WithdrawSeatForm listingId={listing.id} requestId={mine.request.id} />
+          </div>
+        ) : state.isFull ? (
+          <p className="rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+            This table is full.
+          </p>
+        ) : (
+          <RequestSeatForm listingId={listing.id} />
+        )}
+      </section>
+    </main>
+  )
+}
+```
+
+The payment link carries `rel="noopener noreferrer nofollow"` and opens in a new tab. It is a URL one member typed and every other member clicks; the app should not lend it the referrer or any window handle.
+
+- [ ] **Step 4: Verify manually**
+
+Seed a second member and sign in as them using the token escape hatch from Plan 1 Task 7 Step 5.
+
+1. Open the table listed in Task 11 → expect the details, an empty roster, and "Ask for a seat".
+2. Ask for a seat → expect "You've asked for a seat" and a Withdraw button.
+3. Ask again by reloading and resubmitting → the form is gone, so this is not reachable; confirm the guard anyway by re-running `npm test` for the duplicate case.
+4. Withdraw → the request form returns.
+5. As the host, open the same page → expect "Manage this table" instead of a request form.
+
+- [ ] **Step 5: Confirm the production build passes**
+
+```bash
+npm run build
+```
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add "app/tables/[id]/page.tsx" "app/tables/[id]/seat-forms.tsx" "app/tables/[id]/actions.ts"
+git commit -m "feat: add listing detail with seat requests and withdrawal"
+git push
+```
+
+---
+
+### Task 13: The host's manage view
+
+**Files:**
+- Create: `app/tables/[id]/manage/page.tsx`, `app/tables/[id]/manage/decision-buttons.tsx`, `app/tables/[id]/manage/edit-form.tsx`, `app/tables/[id]/manage/actions.ts`
+
+**Interfaces:**
+- Consumes: `approveSeat`, `declineSeat`, `removeSeat` (Task 7); `editListing`, `cancelListing` (Task 5); `toBaliDateTimeValue` (Task 2).
+- Produces: `decideAction(prev, formData)`, `editListingAction(prev, formData)`, `cancelListingAction(prev, formData)`; `interface ManageState { error?: string }`.
+
+- [ ] **Step 1: Write the server actions**
+
+Create `app/tables/[id]/manage/actions.ts`:
+
+```ts
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { isDomainError } from '@/lib/domain/errors'
+import { parseBaliDateTime } from '@/lib/domain/event-time'
+import { parseRupiah } from '@/lib/domain/money'
+import { approveSeat, declineSeat, removeSeat } from '@/lib/domain/seats/decide-seat'
+import { cancelListing, editListing } from '@/lib/domain/tables/manage-listing'
+import { seatsDeps } from '@/lib/seats-service'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+
+export interface ManageState {
+  error?: string
+}
+
+function text(formData: FormData, key: string): string {
+  return String(formData.get(key) ?? '')
+}
+
+function revalidateListing(listingId: string): void {
+  revalidatePath(`/tables/${listingId}`)
+  revalidatePath(`/tables/${listingId}/manage`)
+  revalidatePath('/')
+  revalidatePath('/me')
+}
+
+export async function decideAction(_prev: ManageState, formData: FormData): Promise<ManageState> {
+  const hostId = await requireUserId()
+  const listingId = text(formData, 'listingId')
+  const requestId = text(formData, 'requestId')
+  // The value of whichever submit button was pressed. Browsers include the
+  // activated button's name/value in the payload and no other button's.
+  const decision = text(formData, 'decision')
+
+  try {
+    if (decision === 'approve') await approveSeat(seatsDeps, { requestId, hostId })
+    else if (decision === 'decline') await declineSeat(seatsDeps, { requestId, hostId })
+    else if (decision === 'remove') await removeSeat(seatsDeps, { requestId, hostId })
+    else return { error: 'Unknown action.' }
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+
+export async function editListingAction(_prev: ManageState, formData: FormData): Promise<ManageState> {
+  const hostId = await requireUserId()
+  const listingId = text(formData, 'listingId')
+
+  try {
+    // Every field is sent on every submit. editListing compares each against the
+    // stored value, so resubmitting a frozen price or time unchanged is fine —
+    // only an actual change to a frozen field is rejected.
+    await editListing(tablesDeps, {
+      listingId,
+      hostId,
+      patch: {
+        eventName: text(formData, 'eventName'),
+        notes: text(formData, 'notes'),
+        paymentLink: text(formData, 'paymentLink'),
+        paymentNote: text(formData, 'paymentNote'),
+        seatsOffered: Number(text(formData, 'seatsOffered')),
+        seatPrice: parseRupiah(text(formData, 'seatPrice')),
+        startsAt: parseBaliDateTime(text(formData, 'startsAt')),
+      },
+    })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+
+export async function cancelListingAction(_prev: ManageState, formData: FormData): Promise<ManageState> {
+  const hostId = await requireUserId()
+  const listingId = text(formData, 'listingId')
+
+  try {
+    await cancelListing(tablesDeps, { listingId, hostId })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  // Outside the try: redirect signals by throwing.
+  redirect(`/tables/${listingId}`)
+}
+```
+
+- [ ] **Step 2: Build the decision buttons**
+
+Create `app/tables/[id]/manage/decision-buttons.tsx`:
+
+```tsx
+'use client'
+
+import { useActionState } from 'react'
+import { decideAction, type ManageState } from './actions'
+
+const buttonClass = 'rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50'
+
+export function DecisionButtons({
+  listingId, requestId, actions,
+}: {
+  listingId: string
+  requestId: string
+  actions: Array<'approve' | 'decline' | 'remove'>
+}) {
+  const [state, formAction, pending] = useActionState<ManageState, FormData>(decideAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col items-end gap-2">
+      <input type="hidden" name="listingId" value={listingId} />
+      <input type="hidden" name="requestId" value={requestId} />
+
+      <div className="flex gap-2">
+        {actions.includes('approve') && (
+          <button
+            type="submit" name="decision" value="approve" disabled={pending}
+            className={`${buttonClass} bg-neutral-900 text-white dark:bg-white dark:text-neutral-900`}
+          >
+            Approve
+          </button>
+        )}
+        {actions.includes('decline') && (
+          <button
+            type="submit" name="decision" value="decline" disabled={pending}
+            className={`${buttonClass} border border-neutral-300 dark:border-neutral-700`}
+          >
+            Decline
+          </button>
+        )}
+        {actions.includes('remove') && (
+          <button
+            type="submit" name="decision" value="remove" disabled={pending}
+            className={`${buttonClass} border border-neutral-300 dark:border-neutral-700`}
+          >
+            Remove
+          </button>
+        )}
+      </div>
+
+      {state.error && (
+        <p role="alert" className="text-right text-sm text-red-700 dark:text-red-300">{state.error}</p>
+      )}
+    </form>
+  )
+}
+```
+
+Two submit buttons in one form, distinguished by `name="decision"`, is what keeps a single action handling all three decisions. The alternative — one form per button — would need three actions and three pending states for a row that can only be in one of them at a time.
+
+- [ ] **Step 3: Build the edit and cancel forms**
+
+Create `app/tables/[id]/manage/edit-form.tsx`:
+
+```tsx
+'use client'
+
+import { useActionState } from 'react'
+import { cancelListingAction, editListingAction, type ManageState } from './actions'
+
+const inputClass =
+  'w-full rounded-lg border border-neutral-300 px-4 py-3 text-base read-only:bg-neutral-100 dark:border-neutral-700 dark:bg-neutral-950 dark:read-only:bg-neutral-900'
+const labelClass = 'text-sm font-medium'
+
+export function EditListingForm({
+  listingId, defaults, locked,
+}: {
+  listingId: string
+  defaults: {
+    eventName: string
+    notes: string
+    paymentLink: string
+    paymentNote: string
+    seatsOffered: number
+    seatPrice: string
+    startsAt: string
+  }
+  /** True once anyone has been approved: price and time are frozen. */
+  locked: boolean
+}) {
+  const [state, formAction, pending] = useActionState<ManageState, FormData>(editListingAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col gap-4">
+      <input type="hidden" name="listingId" value={listingId} />
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Starts</span>
+        <input
+          type="datetime-local" name="startsAt" defaultValue={defaults.startsAt}
+          readOnly={locked} className={inputClass}
+        />
+        <span className="text-xs text-neutral-500">
+          Bali time (WITA).{locked && ' Locked — someone has already been approved.'}
+        </span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Price per seat</span>
+        <input name="seatPrice" defaultValue={defaults.seatPrice} readOnly={locked} className={inputClass} />
+        {locked && <span className="text-xs text-neutral-500">Locked. Cancel and relist to change it.</span>}
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Seats for guests</span>
+        <input
+          type="number" name="seatsOffered" min={1} max={20}
+          defaultValue={defaults.seatsOffered} inputMode="numeric" className={inputClass}
+        />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Event name</span>
+        <input name="eventName" defaultValue={defaults.eventName} className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Payment link</span>
+        <input name="paymentLink" defaultValue={defaults.paymentLink} inputMode="url" className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>How to pay</span>
+        <input name="paymentNote" defaultValue={defaults.paymentNote} className={inputClass} />
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className={labelClass}>Notes</span>
+        <textarea name="notes" rows={3} defaultValue={defaults.notes} className={inputClass} />
+      </label>
+
+      {state.error && (
+        <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+          {state.error}
+        </p>
+      )}
+
+      <button
+        type="submit" disabled={pending}
+        className="rounded-lg bg-neutral-900 px-4 py-3 text-base font-medium text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+      >
+        {pending ? 'Saving…' : 'Save changes'}
+      </button>
+    </form>
+  )
+}
+
+export function CancelListingForm({ listingId }: { listingId: string }) {
+  const [state, formAction, pending] = useActionState<ManageState, FormData>(cancelListingAction, {})
+
+  return (
+    <details className="rounded-lg border border-red-200 p-4 dark:border-red-900">
+      <summary className="cursor-pointer text-sm font-medium text-red-700 dark:text-red-300">
+        Cancel this table
+      </summary>
+      <p className="mt-3 text-sm text-neutral-500">
+        Everyone who has a seat loses it and will need refunding by you directly. This cannot be undone.
+      </p>
+      <form action={formAction} className="mt-3">
+        <input type="hidden" name="listingId" value={listingId} />
+        {state.error && (
+          <p role="alert" className="mb-3 text-sm text-red-700 dark:text-red-300">{state.error}</p>
+        )}
+        <button
+          type="submit" disabled={pending}
+          className="w-full rounded-lg bg-red-600 px-4 py-3 text-base font-medium text-white disabled:opacity-50"
+        >
+          {pending ? 'Cancelling…' : 'Yes, cancel the table'}
+        </button>
+      </form>
+    </details>
+  )
+}
+```
+
+The confirmation is a `<details>` disclosure rather than a `confirm()` dialog. A native dialog blocks the page and is awkward to reach on a phone; a disclosure makes the destructive button take two deliberate taps and stays inspectable.
+
+- [ ] **Step 4: Build the manage page**
+
+Create `app/tables/[id]/manage/page.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { notFound, redirect } from 'next/navigation'
+import { formatEventTime, toBaliDateTimeValue } from '@/lib/domain/event-time'
+import { formatRupiah } from '@/lib/domain/money'
+import { deriveSummaryState } from '@/lib/domain/tables/derive'
+import { seatsDeps } from '@/lib/seats-service'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+import { DecisionButtons } from './decision-buttons'
+import { CancelListingForm, EditListingForm } from './edit-form'
+
+export default async function ManageListingPage({ params }: { params: Promise<{ id: string }> }) {
+  const userId = await requireUserId()
+  const { id } = await params
+
+  const summary = await tablesDeps.repository.findListingSummary(id)
+  if (!summary) notFound()
+
+  // A non-host has no business here. Redirect rather than 403: the page they
+  // actually wanted exists and they are allowed to see it.
+  if (summary.listing.hostId !== userId) redirect(`/tables/${id}`)
+
+  const { listing } = summary
+  const state = deriveSummaryState(summary, new Date())
+  const roster = await seatsDeps.repository.listRequestsForListing(listing.id)
+
+  const pending = roster.filter((entry) => entry.request.status === 'pending')
+  const approved = roster.filter((entry) => entry.request.status === 'approved')
+  const settled = roster.filter(
+    (entry) => entry.request.status === 'declined'
+      || entry.request.status === 'withdrawn'
+      || entry.request.status === 'removed',
+  )
+
+  const editable = !state.isCancelled && !state.isPast
+
+  return (
+    <main className="mx-auto max-w-lg px-6 py-8">
+      <Link href={`/tables/${listing.id}`} className="text-sm underline">← Back to the table</Link>
+
+      <h1 className="mt-4 text-2xl font-semibold">Manage</h1>
+      <p className="mt-1 text-sm text-neutral-500">
+        {summary.venue.name} · {formatEventTime(listing.startsAt)} · {formatRupiah(listing.seatPrice)} per seat
+      </p>
+
+      {state.isCancelled && (
+        <p className="mt-4 rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+          This table is cancelled.
+        </p>
+      )}
+      {!state.isCancelled && state.isPast && (
+        <p className="mt-4 rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+          This table has already happened.
+        </p>
+      )}
+
+      <section className="mt-8">
+        <h2 className="text-sm font-medium text-neutral-500">
+          Waiting on you ({pending.length}) · {state.spotsLeft} of {listing.seatsOffered} spots left
+        </h2>
+        <ul className="mt-2 flex flex-col gap-3">
+          {pending.map((entry) => (
+            <li key={entry.request.id} className="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+              <p className="font-medium">{entry.user.name}</p>
+              {entry.user.instagramHandle && (
+                <p className="text-xs text-neutral-500">{entry.user.instagramHandle}</p>
+              )}
+              {entry.request.message && (
+                <p className="mt-2 whitespace-pre-wrap text-sm text-neutral-600 dark:text-neutral-400">
+                  {entry.request.message}
+                </p>
+              )}
+              {editable && (
+                <div className="mt-3">
+                  <DecisionButtons
+                    listingId={listing.id}
+                    requestId={entry.request.id}
+                    actions={['approve', 'decline']}
+                  />
+                </div>
+              )}
+            </li>
+          ))}
+          {pending.length === 0 && <li className="text-sm text-neutral-500">Nothing pending.</li>}
+        </ul>
+      </section>
+
+      <section className="mt-8">
+        <h2 className="text-sm font-medium text-neutral-500">At the table ({approved.length})</h2>
+        <ul className="mt-2 flex flex-col gap-2">
+          {approved.map((entry) => (
+            <li
+              key={entry.request.id}
+              className="flex items-center justify-between gap-3 rounded-lg border border-neutral-200 p-3 dark:border-neutral-800"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-medium">{entry.user.name}</p>
+                {entry.user.instagramHandle && (
+                  <p className="truncate text-xs text-neutral-500">{entry.user.instagramHandle}</p>
+                )}
+              </div>
+              {editable && (
+                <DecisionButtons listingId={listing.id} requestId={entry.request.id} actions={['remove']} />
+              )}
+            </li>
+          ))}
+          {approved.length === 0 && <li className="text-sm text-neutral-500">Nobody yet.</li>}
+        </ul>
+      </section>
+
+      {settled.length > 0 && (
+        <section className="mt-8">
+          <h2 className="text-sm font-medium text-neutral-500">Earlier</h2>
+          <ul className="mt-2 flex flex-col gap-1 text-sm text-neutral-500">
+            {settled.map((entry) => (
+              <li key={entry.request.id}>{entry.user.name} — {entry.request.status}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {editable && (
+        <>
+          <section className="mt-10">
+            <h2 className="text-sm font-medium text-neutral-500">Edit</h2>
+            <div className="mt-2">
+              <EditListingForm
+                listingId={listing.id}
+                locked={approved.length > 0}
+                defaults={{
+                  eventName: listing.eventName ?? '',
+                  notes: listing.notes ?? '',
+                  paymentLink: listing.paymentLink ?? '',
+                  paymentNote: listing.paymentNote ?? '',
+                  seatsOffered: listing.seatsOffered,
+                  seatPrice: String(listing.seatPrice),
+                  startsAt: toBaliDateTimeValue(listing.startsAt),
+                }}
+              />
+            </div>
+          </section>
+
+          <section className="mt-10">
+            <CancelListingForm listingId={listing.id} />
+          </section>
+        </>
+      )}
+    </main>
+  )
+}
+```
+
+- [ ] **Step 5: Verify manually, including the oversell guard from the UI**
+
+```bash
+npm run dev
+```
+
+With one host, a table offering 1 seat, and two members who have both asked:
+
+1. Approve the first → they move to "At the table", spots left goes to 0.
+2. Approve the second → expect "This table just filled up." in red under the buttons, and the request stays pending.
+3. Remove the first → the second can now be approved.
+4. Try to change the price while someone is approved → the field is read-only; change it with dev tools and submit → expect "You cannot change the price once someone has been approved."
+5. Raise seats from 1 to 2 while someone is approved → expect success.
+6. Cancel the table → expect a redirect to the detail page showing "This table was cancelled", and every approved guest moved to `removed`:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select status, count(*) from seat_requests group by status"
+```
+
+- [ ] **Step 6: Confirm the production build passes**
+
+```bash
+npm run build
+```
+
+- [ ] **Step 7: Commit and push**
+
+```bash
+git add "app/tables/[id]/manage"
+git commit -m "feat: add the host manage view with approvals, edits, and cancellation"
+git push
+```
+
+---
