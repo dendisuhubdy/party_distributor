@@ -4963,3 +4963,171 @@ git push
 ```
 
 ---
+
+### Task 14: The "me" page
+
+**Files:**
+- Create: `app/me/page.tsx`
+
+**Interfaces:**
+- Consumes: `listListingsHostedBy` (Task 8), `listSeatsHeldBy` (Task 9), `deriveSummaryState` (Task 3), `ListingCard` (Task 10).
+- Produces: nothing consumed by later tasks in this plan. Plan 3 adds a payment column here.
+
+- [ ] **Step 1: Build the page**
+
+Create `app/me/page.tsx`:
+
+```tsx
+import Link from 'next/link'
+import { formatRupiah } from '@/lib/domain/money'
+import { deriveSummaryState } from '@/lib/domain/tables/derive'
+import { seatsDeps } from '@/lib/seats-service'
+import { requireUserId } from '@/lib/session'
+import { tablesDeps } from '@/lib/tables-service'
+import { ListingCard } from '../listing-card'
+
+export default async function MePage() {
+  const userId = await requireUserId()
+  const now = new Date()
+
+  const [hosted, held] = await Promise.all([
+    tablesDeps.repository.listListingsHostedBy(userId),
+    seatsDeps.repository.listSeatsHeldBy(userId),
+  ])
+
+  const upcomingHosted = hosted.filter((summary) => !deriveSummaryState(summary, now).isPast)
+  const pastHosted = hosted.filter((summary) => deriveSummaryState(summary, now).isPast)
+
+  const approvedSeats = held.filter((seat) => seat.request.status === 'approved')
+  const owed = approvedSeats
+    .filter((seat) => !deriveSummaryState(seat.listing, now).isPast)
+    .reduce((total, seat) => total + seat.listing.listing.seatPrice, 0)
+
+  return (
+    <main className="mx-auto max-w-lg px-6 py-8">
+      <h1 className="text-2xl font-semibold">You</h1>
+
+      <section className="mt-8">
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="text-sm font-medium text-neutral-500">Seats you hold ({held.length})</h2>
+          {owed > 0 && (
+            <p className="text-sm">
+              <span className="text-neutral-500">To pay </span>
+              <span className="font-medium">{formatRupiah(owed)}</span>
+            </p>
+          )}
+        </div>
+
+        <ul className="mt-2 flex flex-col gap-3">
+          {held.map((seat) => (
+            <li key={seat.request.id}>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                    seat.request.status === 'approved'
+                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                      : 'bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300'
+                  }`}
+                >
+                  {seat.request.status === 'approved' ? 'Confirmed' : 'Waiting'}
+                </span>
+              </div>
+              <div className="mt-1">
+                <ListingCard summary={seat.listing} now={now} />
+              </div>
+            </li>
+          ))}
+          {held.length === 0 && (
+            <li className="text-sm text-neutral-500">
+              No seats yet. <Link href="/" className="underline">Find a table</Link>.
+            </li>
+          )}
+        </ul>
+      </section>
+
+      <section className="mt-10">
+        <h2 className="text-sm font-medium text-neutral-500">Tables you host ({upcomingHosted.length})</h2>
+        <ul className="mt-2 flex flex-col gap-3">
+          {upcomingHosted.map((summary) => (
+            <li key={summary.listing.id}>
+              <ListingCard summary={summary} now={now} />
+              <Link
+                href={`/tables/${summary.listing.id}/manage`}
+                className="mt-1 inline-block text-sm underline"
+              >
+                Manage
+              </Link>
+            </li>
+          ))}
+          {upcomingHosted.length === 0 && (
+            <li className="text-sm text-neutral-500">
+              Nothing coming up. <Link href="/tables/new" className="underline">List a table</Link>.
+            </li>
+          )}
+        </ul>
+      </section>
+
+      {pastHosted.length > 0 && (
+        <section className="mt-10">
+          <h2 className="text-sm font-medium text-neutral-500">Earlier tables</h2>
+          <ul className="mt-2 flex flex-col gap-3">
+            {pastHosted.map((summary) => (
+              <li key={summary.listing.id}>
+                <ListingCard summary={summary} now={now} />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+    </main>
+  )
+}
+```
+
+The "to pay" total is computed from the listing's current price rather than from `seat_payments.amount`, because `seat_payments` is not read anywhere in this plan. Plan 3 replaces this line with the captured amount and the actual payment state — until then the number is right only because the price freeze makes it right.
+
+- [ ] **Step 2: Verify manually**
+
+Sign in as a member who hosts one table and holds a seat at another. Expect both sections populated, the "To pay" total equal to the seat price of the confirmed seat, a "Waiting" badge on a pending request, and a working Manage link.
+
+- [ ] **Step 3: Run everything**
+
+```bash
+npm test && npm run test:integration && npm run lint && npm run build
+```
+
+Expected: all green.
+
+- [ ] **Step 4: Commit and push**
+
+```bash
+git add app/me
+git commit -m "feat: add the me page listing hosted tables and held seats"
+git push
+```
+
+---
+
+## Definition of done
+
+- [ ] `npm test`, `npm run test:integration`, `npm run lint`, and `npm run build` all pass.
+- [ ] `TZ=UTC npm test` and `TZ=America/New_York npm test` produce identical results — the event-time module is genuinely timezone-independent.
+- [ ] The four-way concurrent approval test has been observed **failing** with `.for('update')` removed, and passing with it restored.
+- [ ] A table listed at 22:00 stores a `starts_at` that reads 22:00 when converted to `Asia/Makassar`, verified with psql.
+- [ ] Approving into a full table shows the host "This table just filled up." rather than a 500.
+- [ ] Changing a price after an approval is refused; raising the seat count after an approval succeeds.
+- [ ] Cancelling a table moves every approved request to `removed` and every pending one to `declined`, and the same person can then request a seat again.
+- [ ] A member who is not the host is redirected away from `/tables/[id]/manage`.
+- [ ] No `new Date(` appears anywhere in `lib/domain/**` — `grep -rn "new Date(" lib/domain` returns only `event-time.ts`, where the constructor takes explicit numeric components rather than a string.
+
+**Not done, and known:** nothing sends email yet. A host learns about a seat request only by opening the app, and a guest learns they were approved the same way. `seat_payments` rows are created at approval but never read or updated, so a host cannot record who has paid. Both are Plan 3.
+
+## What Plan 3 picks up
+
+**Settlement.** The `seat_payments` row already exists for every approved seat, carrying the price captured at approval. Plan 3 adds the state machine on top: a guest marks their seat paid, the host confirms it, and a guest who withdraws after paying surfaces as "refund owed" on the host's grid. The payment grid joins `/tables/[id]/manage`, and `/me` gains a real per-seat payment status instead of the derived total in Task 14.
+
+**Notifications.** The `email_log` table and its `unique(kind, entity_id, to_user_id)` idempotency constraint are already in place. Plan 3 adds the `notify` module and wires it into the flows this plan built — a new listing to all active members, a seat request to the host, an approval to the guest with the payment link, a decline to the guest, and a cancellation to the `removedUserIds` and `declinedUserIds` that `cancelListing` already returns and this plan discards.
+
+**The day-before reminder,** as a `POST /api/cron/reminders` route guarded by a shared secret and called by a `cron.daily` entry on the Droplet.
+
+**Playwright,** four paths only: invite to signup; create a table; request, approve, mark paid; cancel cascades.
