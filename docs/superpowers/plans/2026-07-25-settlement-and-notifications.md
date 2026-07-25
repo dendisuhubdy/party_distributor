@@ -1132,3 +1132,457 @@ git push
 ```
 
 ---
+
+### Task 4: The host's payment grid
+
+**Files:**
+- Create: `lib/settlement-service.ts`, `app/tables/[id]/manage/payment-grid.tsx`
+- Modify: `app/tables/[id]/manage/actions.ts`, `app/tables/[id]/manage/page.tsx`
+
+**Interfaces:**
+- Consumes: `confirmSeatPayment` (Task 2), `buildPaymentGrid`/`totalOutstanding` (Task 1), `PostgresSettlementRepository` (Task 3).
+- Produces: `settlementDeps`; `confirmPaymentAction(prev, formData)`; `<PaymentGrid rows total listingId editable />`.
+
+- [ ] **Step 1: Wire settlement to the database**
+
+Create `lib/settlement-service.ts`:
+
+```ts
+import { db } from '@/lib/db/client'
+import { PostgresSettlementRepository } from '@/lib/db/repositories/settlement'
+import type { SettlementDeps } from '@/lib/domain/settlement/ports'
+
+export const settlementDeps: SettlementDeps = {
+  repository: new PostgresSettlementRepository(db),
+  now: () => new Date(),
+}
+```
+
+- [ ] **Step 2: Add the confirm action**
+
+Append to `app/tables/[id]/manage/actions.ts`:
+
+```ts
+import { confirmSeatPayment } from '@/lib/domain/settlement/record-payment'
+import { settlementDeps } from '@/lib/settlement-service'
+```
+
+```ts
+export async function confirmPaymentAction(_prev: ManageState, formData: FormData): Promise<ManageState> {
+  const hostId = await requireUserId()
+  const listingId = text(formData, 'listingId')
+
+  try {
+    await confirmSeatPayment(settlementDeps, {
+      requestId: text(formData, 'requestId'),
+      hostId,
+      note: text(formData, 'note') || null,
+    })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+```
+
+- [ ] **Step 3: Build the grid**
+
+Create `app/tables/[id]/manage/payment-grid.tsx`:
+
+```tsx
+'use client'
+
+import { useActionState } from 'react'
+import { formatRupiah } from '@/lib/domain/money'
+import type { PaymentRow, PaymentState } from '@/lib/domain/settlement/types'
+import { confirmPaymentAction, type ManageState } from './actions'
+
+const STATE_LABEL: Record<PaymentState, string> = {
+  unpaid: 'Not paid',
+  marked_paid: 'Says paid',
+  confirmed: 'Paid',
+  refund_owed: 'Refund owed',
+}
+
+const STATE_TONE: Record<PaymentState, string> = {
+  unpaid: 'bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300',
+  marked_paid: 'bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200',
+  confirmed: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300',
+  refund_owed: 'bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300',
+}
+
+function ConfirmButton({ listingId, requestId }: { listingId: string; requestId: string }) {
+  const [state, formAction, pending] = useActionState<ManageState, FormData>(confirmPaymentAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col items-end gap-1">
+      <input type="hidden" name="listingId" value={listingId} />
+      <input type="hidden" name="requestId" value={requestId} />
+      <button
+        type="submit" disabled={pending}
+        className="rounded-lg border border-neutral-300 px-3 py-2 text-sm font-medium disabled:opacity-50 dark:border-neutral-700"
+      >
+        {pending ? 'Saving…' : 'Mark received'}
+      </button>
+      {state.error && (
+        <p role="alert" className="text-right text-sm text-red-700 dark:text-red-300">{state.error}</p>
+      )}
+    </form>
+  )
+}
+
+export function PaymentGrid({
+  rows, total, listingId, editable,
+}: {
+  rows: PaymentRow[]
+  total: number
+  listingId: string
+  editable: boolean
+}) {
+  if (rows.length === 0) {
+    return <p className="mt-2 text-sm text-neutral-500">Nothing to settle yet.</p>
+  }
+
+  return (
+    <>
+      <ul className="mt-2 flex flex-col gap-2">
+        {rows.map((row) => (
+          <li
+            key={row.request.id}
+            className="flex items-center justify-between gap-3 rounded-lg border border-neutral-200 p-3 dark:border-neutral-800"
+          >
+            <div className="min-w-0">
+              <p className="truncate font-medium">{row.user.name}</p>
+              <p className="text-sm text-neutral-500">
+                {formatRupiah(row.payment.amount)}
+                {row.payment.method && <> · {row.payment.method}</>}
+              </p>
+              <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${STATE_TONE[row.state]}`}>
+                {STATE_LABEL[row.state]}
+              </span>
+            </div>
+
+            {editable && row.state !== 'confirmed' && row.state !== 'refund_owed' && (
+              <ConfirmButton listingId={listingId} requestId={row.request.id} />
+            )}
+          </li>
+        ))}
+      </ul>
+
+      <p className="mt-3 text-sm">
+        <span className="text-neutral-500">Still to collect </span>
+        <span className="font-medium">{formatRupiah(total)}</span>
+      </p>
+
+      {rows.some((row) => row.state === 'refund_owed') && (
+        <p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800 dark:bg-red-950 dark:text-red-300">
+          Someone paid and then left the table. Send their money back directly — the app never held it and
+          cannot return it for you.
+        </p>
+      )}
+    </>
+  )
+}
+```
+
+The refund banner states the boundary plainly rather than offering a button. A "Refund" control the app cannot honour would be worse than no control at all.
+
+- [ ] **Step 4: Add the grid to the manage page**
+
+In `app/tables/[id]/manage/page.tsx`, add the imports:
+
+```tsx
+import { buildPaymentGrid, totalOutstanding } from '@/lib/domain/settlement/derive'
+import { settlementDeps } from '@/lib/settlement-service'
+import { PaymentGrid } from './payment-grid'
+```
+
+Load the entries alongside the roster:
+
+```tsx
+  const paymentEntries = await settlementDeps.repository.listPaymentsForListing(listing.id)
+  const paymentRows = buildPaymentGrid(paymentEntries)
+```
+
+And insert a section immediately after the "At the table" section, before "Earlier":
+
+```tsx
+      <section className="mt-8">
+        <h2 className="text-sm font-medium text-neutral-500">Money</h2>
+        <PaymentGrid
+          rows={paymentRows}
+          total={totalOutstanding(paymentRows)}
+          listingId={listing.id}
+          editable={!state.isCancelled}
+        />
+      </section>
+```
+
+`editable` is `!state.isCancelled` rather than the page's `editable`. A host must still be able to record payments for a table that has already happened — that is precisely when they are settling up.
+
+- [ ] **Step 5: Verify manually**
+
+```bash
+npm run dev
+```
+
+With a table holding two approved guests:
+
+1. Open `/tables/[id]/manage` → expect both guests listed under Money, both "Not paid", and "Still to collect" equal to twice the seat price.
+2. Tap "Mark received" on one → it turns green, "Paid", the button disappears, and the total halves.
+3. Tap it again on the other, then reload → the states persist.
+4. Remove a guest whose payment is confirmed → their row turns red, "Refund owed", the banner appears, and the total does not include them.
+5. Change the system clock forward past the event, or edit `starts_at` in psql, and reload → the grid still offers "Mark received".
+
+- [ ] **Step 6: Commit and push**
+
+```bash
+git add lib/settlement-service.ts "app/tables/[id]/manage"
+git commit -m "feat: add the host payment grid with confirmations"
+git push
+```
+
+---
+
+### Task 5: The guest's side of payment
+
+**Files:**
+- Modify: `app/tables/[id]/actions.ts`, `app/tables/[id]/seat-forms.tsx`, `app/tables/[id]/page.tsx`
+- Modify: `app/me/page.tsx`
+
+**Interfaces:**
+- Consumes: `markSeatPaid` (Task 2), `derivePaymentState` (Task 1), `listPaymentsForUser` (Task 3).
+- Produces: `markPaidAction(prev, formData)`; `<MarkPaidForm listingId requestId />`.
+
+- [ ] **Step 1: Add the mark-paid action**
+
+Append to `app/tables/[id]/actions.ts`:
+
+```ts
+import { markSeatPaid } from '@/lib/domain/settlement/record-payment'
+import { settlementDeps } from '@/lib/settlement-service'
+```
+
+```ts
+export async function markPaidAction(
+  _prev: SeatActionState,
+  formData: FormData,
+): Promise<SeatActionState> {
+  const userId = await requireUserId()
+  const listingId = String(formData.get('listingId') ?? '')
+
+  try {
+    await markSeatPaid(settlementDeps, {
+      requestId: String(formData.get('requestId') ?? ''),
+      userId,
+      method: String(formData.get('method') ?? '') || null,
+    })
+  } catch (error) {
+    if (isDomainError(error)) return { error: error.message }
+    throw error
+  }
+
+  revalidateListing(listingId)
+  return {}
+}
+```
+
+- [ ] **Step 2: Add the form**
+
+Append to `app/tables/[id]/seat-forms.tsx`:
+
+```tsx
+import { markPaidAction } from './actions'
+```
+
+```tsx
+export function MarkPaidForm({ listingId, requestId }: { listingId: string; requestId: string }) {
+  const [state, formAction, pending] = useActionState<SeatActionState, FormData>(markPaidAction, {})
+
+  return (
+    <form action={formAction} className="flex flex-col gap-3">
+      <input type="hidden" name="listingId" value={listingId} />
+      <input type="hidden" name="requestId" value={requestId} />
+      <input
+        name="method" maxLength={40} placeholder="How you paid (optional)"
+        className="w-full rounded-lg border border-neutral-300 px-4 py-3 text-base dark:border-neutral-700 dark:bg-neutral-950"
+      />
+      <ErrorMessage state={state} />
+      <button type="submit" disabled={pending} className={secondaryClass}>
+        {pending ? 'Saving…' : "I've paid"}
+      </button>
+    </form>
+  )
+}
+```
+
+- [ ] **Step 3: Show payment status on the listing page**
+
+In `app/tables/[id]/page.tsx`, add the imports:
+
+```tsx
+import { derivePaymentState } from '@/lib/domain/settlement/derive'
+import { settlementDeps } from '@/lib/settlement-service'
+import { MarkPaidForm, RequestSeatForm, WithdrawSeatForm } from './seat-forms'
+```
+
+After `mine` is computed, load this member's payment for the seat:
+
+```tsx
+  const minePayment = mine?.request.status === 'approved'
+    ? await settlementDeps.repository.findSeatPayment(mine.request.id)
+    : null
+  const minePaymentState = minePayment
+    ? derivePaymentState(minePayment.payment, minePayment.request.status)
+    : null
+```
+
+Then replace the body of the `mine?.request.status === 'approved'` branch with:
+
+```tsx
+          <div className="flex flex-col gap-3">
+            <p className="rounded-lg bg-emerald-50 p-4 text-sm text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">
+              You&apos;re in. {formatRupiah(minePayment?.payment.amount ?? listing.seatPrice)} to {host.name}.
+              {listing.paymentNote && <> {listing.paymentNote}</>}
+            </p>
+
+            {minePaymentState === 'confirmed' ? (
+              <p className="rounded-lg bg-neutral-100 p-4 text-sm dark:bg-neutral-900">
+                {host.name} confirmed your payment. Nothing left to do.
+              </p>
+            ) : minePaymentState === 'marked_paid' ? (
+              <p className="rounded-lg bg-amber-50 p-4 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                You marked this paid. Waiting for {host.name} to confirm.
+              </p>
+            ) : (
+              <>
+                {listing.paymentLink && (
+                  <a
+                    href={listing.paymentLink}
+                    rel="noopener noreferrer nofollow"
+                    target="_blank"
+                    className="block rounded-lg bg-neutral-900 px-4 py-3 text-center text-base font-medium text-white dark:bg-white dark:text-neutral-900"
+                  >
+                    Pay the host
+                  </a>
+                )}
+                <MarkPaidForm listingId={listing.id} requestId={mine.request.id} />
+              </>
+            )}
+
+            <WithdrawSeatForm listingId={listing.id} requestId={mine.request.id} />
+          </div>
+```
+
+The amount comes from the payment row rather than the listing. They are equal today because the price freeze makes them equal, but the payment row is the one that was agreed to, and reading it here means a future change to the freeze rule cannot quietly reprice someone's existing seat.
+
+The "marked paid, awaiting host" state is deliberately visible to the guest. Without it, a host who never confirms leaves the guest unable to tell whether anything registered.
+
+- [ ] **Step 4: Show real payment status on `/me`**
+
+In `app/me/page.tsx`, replace the seats section's data loading. Add imports:
+
+```tsx
+import { derivePaymentState } from '@/lib/domain/settlement/derive'
+import type { PaymentState } from '@/lib/domain/settlement/types'
+import { settlementDeps } from '@/lib/settlement-service'
+```
+
+Replace the `held` / `owed` computation with:
+
+```tsx
+  const [hosted, held, payments] = await Promise.all([
+    tablesDeps.repository.listListingsHostedBy(userId),
+    seatsDeps.repository.listSeatsHeldBy(userId),
+    settlementDeps.repository.listPaymentsForUser(userId),
+  ])
+
+  const paymentByRequest = new Map(payments.map((entry) => [entry.request.id, entry]))
+
+  const seatStates = held.map((seat) => {
+    const entry = paymentByRequest.get(seat.request.id)
+    const state: PaymentState | null = entry
+      ? derivePaymentState(entry.payment, entry.request.status)
+      : null
+    return { seat, state, amount: entry?.payment.amount ?? seat.listing.listing.seatPrice }
+  })
+
+  // What this member still has to send: approved seats whose payment the host
+  // has not confirmed. A seat they marked paid still counts — until the host
+  // agrees it arrived, it is not settled.
+  const owed = seatStates
+    .filter(({ seat, state }) => seat.request.status === 'approved' && state !== 'confirmed')
+    .reduce((total, { amount }) => total + amount, 0)
+```
+
+Then render the badge from the payment state, replacing the existing status badge block inside the `held.map`:
+
+```tsx
+        <ul className="mt-2 flex flex-col gap-3">
+          {seatStates.map(({ seat, state }) => (
+            <li key={seat.request.id}>
+              <div className="flex items-center gap-2">
+                {seat.request.status === 'pending' ? (
+                  <span className="rounded-full bg-neutral-200 px-2 py-0.5 text-xs font-medium text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
+                    Waiting on the host
+                  </span>
+                ) : state === 'confirmed' ? (
+                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                    Paid
+                  </span>
+                ) : state === 'marked_paid' ? (
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                    Awaiting confirmation
+                  </span>
+                ) : (
+                  <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-800 dark:bg-red-950 dark:text-red-300">
+                    To pay
+                  </span>
+                )}
+              </div>
+              <div className="mt-1">
+                <ListingCard summary={seat.listing} now={now} />
+              </div>
+            </li>
+          ))}
+          {seatStates.length === 0 && (
+            <li className="text-sm text-neutral-500">
+              No seats yet. <Link href="/" className="underline">Find a table</Link>.
+            </li>
+          )}
+        </ul>
+```
+
+- [ ] **Step 5: Verify manually, from both sides**
+
+Sign in as a guest holding an approved seat:
+
+1. `/tables/[id]` → expect the price, the pay link, and "I've paid".
+2. Tap "I've paid" with method "GoPay" → expect "Waiting for {host} to confirm", and the button gone.
+3. `/me` → expect the amber "Awaiting confirmation" badge and the seat still counted in "To pay".
+4. As the host, tap "Mark received" → back as the guest, expect "confirmed your payment. Nothing left to do." and a green "Paid" badge on `/me`, with "To pay" now excluding it.
+5. Tap "I've paid" twice quickly → the timestamp must not move:
+
+```bash
+docker compose exec -T db psql -U party -d party -c \
+  "select marked_paid_at, confirmed_at, method from seat_payments"
+```
+
+- [ ] **Step 6: Run everything**
+
+```bash
+npm test && npm run test:integration && npm run lint && npm run build
+```
+
+- [ ] **Step 7: Commit and push**
+
+```bash
+git add "app/tables/[id]" app/me
+git commit -m "feat: let guests mark seats paid and see their payment status"
+git push
+```
+
+---
