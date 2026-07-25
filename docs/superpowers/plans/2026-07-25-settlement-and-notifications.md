@@ -3476,3 +3476,534 @@ git push
 ```
 
 ---
+
+### Task 11: Playwright, four paths only
+
+End-to-end tests are slow and brittle. Four load-bearing ones beat forty.
+
+**Files:**
+- Create: `playwright.config.ts`, `e2e/support/db.ts`, `e2e/support/fixtures.ts`
+- Create: `e2e/invite-to-signup.spec.ts`, `e2e/create-a-table.spec.ts`, `e2e/request-approve-pay.spec.ts`, `e2e/cancel-cascades.spec.ts`
+- Modify: `package.json`, `.env.example`, `.gitignore`
+
+**Interfaces:**
+- Consumes: the whole running application.
+- Produces: `npm run test:e2e`; an `asMember` fixture that signs a seeded member in without any email.
+
+- [ ] **Step 1: Install Playwright and create its database**
+
+```bash
+npm install -D @playwright/test
+npx playwright install chromium
+```
+
+E2E gets its own database so a run cannot truncate the integration suite's data mid-flight:
+
+```bash
+docker compose exec -T db psql -U party -d party -c "CREATE DATABASE party_e2e"
+E2E_DATABASE_URL=postgres://party:party@localhost:5433/party_e2e
+DATABASE_URL=$E2E_DATABASE_URL npm run db:migrate
+```
+
+Add to `.env.example`:
+
+```
+E2E_DATABASE_URL=postgres://party:party@localhost:5433/party_e2e
+```
+
+Add to `.gitignore`:
+
+```
+/test-results
+/playwright-report
+/playwright/.cache
+```
+
+Add to `package.json` scripts:
+
+```json
+"test:e2e": "playwright test"
+```
+
+- [ ] **Step 2: Configure Playwright**
+
+Create `playwright.config.ts`:
+
+```ts
+import 'dotenv/config'
+import { defineConfig, devices } from '@playwright/test'
+
+const DATABASE_URL = process.env.E2E_DATABASE_URL
+if (!DATABASE_URL) throw new Error('E2E_DATABASE_URL is not set. See .env.example.')
+
+const BASE_URL = 'http://localhost:3100'
+
+export default defineConfig({
+  testDir: './e2e',
+  // Every spec shares one database and truncates it, so they must not overlap.
+  workers: 1,
+  fullyParallel: false,
+  timeout: 30_000,
+  expect: { timeout: 10_000 },
+  retries: process.env.CI ? 1 : 0,
+  use: {
+    baseURL: BASE_URL,
+    // A phone, because that is the only device this product is used on.
+    ...devices['iPhone 13'],
+    trace: 'retain-on-failure',
+  },
+  webServer: {
+    // The dev server, not a production build: a build per run would add a
+    // minute to every invocation, and none of these four paths depends on
+    // production-only behaviour. Port 3100 keeps it clear of `npm run dev`.
+    command: 'npm run dev -- --port 3100',
+    url: BASE_URL,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+    env: {
+      DATABASE_URL,
+      AUTH_URL: BASE_URL,
+      APP_URL: BASE_URL,
+      AUTH_SECRET: process.env.AUTH_SECRET ?? 'e2e-secret-not-for-production',
+      // Deliberately invalid. Nothing in these tests reads an inbox, and a
+      // failing sender proves email cannot break the flows underneath it.
+      RESEND_API_KEY: 'e2e-invalid-key',
+      EMAIL_FROM: 'Party <onboarding@resend.dev>',
+    },
+  },
+})
+```
+
+- [ ] **Step 3: Write the database helper**
+
+Create `e2e/support/db.ts`:
+
+```ts
+import { randomUUID } from 'node:crypto'
+import postgres from 'postgres'
+
+const url = process.env.E2E_DATABASE_URL
+if (!url) throw new Error('E2E_DATABASE_URL is not set')
+
+export const sql = postgres(url, { max: 4 })
+
+export async function truncateAll(): Promise<void> {
+  await sql`
+    truncate table
+      email_log, seat_payments, seat_requests, table_listings,
+      venues, invites, sessions, accounts, verification_tokens, users
+    restart identity cascade
+  `
+}
+
+export async function createMember(name: string, email = `${name.toLowerCase()}@example.com`) {
+  const [user] = await sql<{ id: string }[]>`
+    insert into users (email, name) values (${email}, ${name}) returning id
+  `
+  return { id: user.id, name, email }
+}
+
+export async function createVenue(name = 'Savaya', city = 'Bali') {
+  const [venue] = await sql<{ id: string }[]>`
+    insert into venues (name, city) values (${name}, ${city}) returning id
+  `
+  return venue.id
+}
+
+export async function createInvite(createdBy: string, code = 'ABCD-EFGH') {
+  const [invite] = await sql<{ id: string; code: string }[]>`
+    insert into invites (code, created_by, expires_at)
+    values (${code}, ${createdBy}, now() + interval '30 days')
+    returning id, code
+  `
+  return invite
+}
+
+/**
+ * Mint a database session for a member and return its token.
+ *
+ * Auth.js is configured with `session: { strategy: 'database' }`, so a session
+ * is exactly one row plus one cookie. Writing both directly is what lets these
+ * tests sign in without an inbox — and it needs no test-only route in the
+ * application, which would be a live session-minting endpoint in production.
+ */
+export async function createSession(userId: string): Promise<string> {
+  const token = randomUUID()
+  await sql`
+    insert into sessions (session_token, user_id, expires)
+    values (${token}, ${userId}, now() + interval '1 day')
+  `
+  return token
+}
+
+export async function seatStatuses(tableId: string) {
+  return sql<{ user_id: string; status: string }[]>`
+    select user_id, status from seat_requests where table_id = ${tableId}
+  `
+}
+```
+
+- [ ] **Step 4: Write the sign-in fixture**
+
+Create `e2e/support/fixtures.ts`:
+
+```ts
+import { test as base, type BrowserContext } from '@playwright/test'
+import { createSession, truncateAll } from './db'
+
+/**
+ * The cookie Auth.js reads. Over plain HTTP it is unprefixed; over HTTPS it
+ * becomes `__Secure-authjs.session-token`. These tests run on http://localhost.
+ *
+ * If the fixture ever stops signing anyone in, verify this name first: sign in
+ * by hand in a real browser and read the cookie back. A wrong name here fails
+ * as a silent redirect to /login, not as an error.
+ */
+const SESSION_COOKIE = 'authjs.session-token'
+
+export interface Member {
+  id: string
+  name: string
+  email: string
+}
+
+async function signIn(context: BrowserContext, member: Member): Promise<void> {
+  const token = await createSession(member.id)
+  await context.addCookies([{
+    name: SESSION_COOKIE,
+    value: token,
+    domain: 'localhost',
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Lax',
+  }])
+}
+
+export const test = base.extend<{
+  /** Sign the given member into a browser context. */
+  asMember: (context: BrowserContext, member: Member) => Promise<void>
+}>({
+  asMember: async ({}, use) => {
+    await use(signIn)
+  },
+})
+
+test.beforeEach(async () => {
+  await truncateAll()
+})
+
+export { expect } from '@playwright/test'
+```
+
+- [ ] **Step 5: Path one — invite to signup**
+
+Create `e2e/invite-to-signup.spec.ts`:
+
+```ts
+import { createInvite, createMember, sql } from './support/db'
+import { expect, test } from './support/fixtures'
+
+test('an invited person becomes a member with their own codes', async ({ page }) => {
+  const founder = await createMember('Founder')
+  const invite = await createInvite(founder.id, 'JOIN-TEST')
+
+  await page.goto(`/join?code=${invite.code}`)
+
+  // The code arrives prefilled, which is what makes a shared link work in one tap.
+  await expect(page.locator('input[name="code"]')).toHaveValue(invite.code)
+
+  await page.fill('input[name="name"]', 'Rina')
+  await page.fill('input[name="email"]', 'rina@example.com')
+  await page.fill('input[name="instagramHandle"]', '@rina')
+  await page.click('button[type="submit"]')
+
+  // The account and the invite are asserted in the database rather than on
+  // screen. The last thing joinAction does is request a magic link, and the
+  // sender is deliberately misconfigured in this suite — so the page that
+  // renders next is not the interesting outcome. That the account exists,
+  // attributed to its inviter, and that the code is spent, is.
+  await expect(async () => {
+    const [created] = await sql<{ id: string; invited_by: string; instagram_handle: string }[]>`
+      select id, invited_by, instagram_handle from users where email = 'rina@example.com'
+    `
+    expect(created).toBeDefined()
+    expect(created.invited_by).toBe(founder.id)
+    expect(created.instagram_handle).toBe('@rina')
+
+    const [used] = await sql<{ redeemed_by: string; redeemed_at: Date }[]>`
+      select redeemed_by, redeemed_at from invites where id = ${invite.id}
+    `
+    expect(used.redeemed_by).toBe(created.id)
+    expect(used.redeemed_at).not.toBeNull()
+  }).toPass()
+})
+
+test('a spent code cannot be used again', async ({ page }) => {
+  const founder = await createMember('Founder')
+  const invite = await createInvite(founder.id, 'ONCE-ONLY')
+  await sql`
+    update invites set redeemed_by = ${founder.id}, redeemed_at = now() where id = ${invite.id}
+  `
+
+  await page.goto(`/join?code=${invite.code}`)
+  await page.fill('input[name="name"]', 'Too Late')
+  await page.fill('input[name="email"]', 'toolate@example.com')
+  await page.click('button[type="submit"]')
+
+  await expect(page.getByRole('alert')).toContainText('already been used')
+
+  const rows = await sql`select id from users where email = 'toolate@example.com'`
+  expect(rows).toHaveLength(0)
+})
+```
+
+- [ ] **Step 6: Path two — create a table**
+
+Create `e2e/create-a-table.spec.ts`:
+
+```ts
+import { createMember, createVenue, sql } from './support/db'
+import { expect, test } from './support/fixtures'
+
+test('a host lists a table and it appears on the feed', async ({ page, context, asMember }) => {
+  const host = await createMember('Host')
+  await createVenue('Savaya')
+  await asMember(context, host)
+
+  await page.goto('/tables/new')
+
+  await page.selectOption('select[name="venueId"]', { label: 'Savaya' })
+  // Bali wall-clock time. The assertion below is what proves it is stored as such.
+  await page.fill('input[name="startsAt"]', '2099-08-15T22:00')
+  await page.fill('input[name="seatsOffered"]', '4')
+  await page.fill('input[name="seatPrice"]', '2.500.000')
+  await page.fill('input[name="eventName"]', 'Peggy Gou')
+  await page.fill('input[name="paymentNote"]', 'GoPay to 0812')
+  await page.click('button[type="submit"]')
+
+  await expect(page).toHaveURL(/\/tables\/[0-9a-f-]{36}$/)
+  await expect(page.getByRole('heading', { name: 'Savaya' })).toBeVisible()
+  await expect(page.getByText('Peggy Gou')).toBeVisible()
+  await expect(page.getByText('Rp 2.500.000')).toBeVisible()
+  await expect(page.getByText('4 of 4 left')).toBeVisible()
+
+  const [stored] = await sql<{ bali: string; seat_price: string }[]>`
+    select to_char(starts_at at time zone 'Asia/Makassar', 'YYYY-MM-DD HH24:MI') as bali,
+           seat_price
+    from table_listings
+  `
+  // 22:00 Bali, not 22:00 UTC. This single assertion is the reason the whole
+  // event-time module exists.
+  expect(stored.bali).toBe('2099-08-15 22:00')
+  expect(Number(stored.seat_price)).toBe(2_500_000)
+
+  await page.goto('/')
+  await expect(page.getByText('Savaya')).toBeVisible()
+  await expect(page.getByText('4 left')).toBeVisible()
+})
+```
+
+- [ ] **Step 7: Path three — request, approve, mark paid**
+
+Create `e2e/request-approve-pay.spec.ts`:
+
+```ts
+import { createMember, createVenue, sql } from './support/db'
+import { expect, test } from './support/fixtures'
+
+test('a guest asks, the host approves, the guest pays, the host confirms', async ({
+  browser, page, context, asMember,
+}) => {
+  const host = await createMember('Host')
+  const guest = await createMember('Rina')
+  const venueId = await createVenue('Savaya')
+
+  const [listing] = await sql<{ id: string }[]>`
+    insert into table_listings (host_id, venue_id, starts_at, seats_offered, seat_price, payment_note)
+    values (${host.id}, ${venueId}, now() + interval '10 days', 2, 2500000, 'GoPay to 0812')
+    returning id
+  `
+
+  // --- the guest asks ---
+  await asMember(context, guest)
+  await page.goto(`/tables/${listing.id}`)
+  await page.fill('textarea[name="message"]', 'Bringing a friend later')
+  await page.click('button:has-text("Ask for a seat")')
+  await expect(page.getByText('will decide')).toBeVisible()
+
+  // --- the host approves ---
+  const hostContext = await browser.newContext()
+  await asMember(hostContext, host)
+  const hostPage = await hostContext.newPage()
+
+  await hostPage.goto(`/tables/${listing.id}/manage`)
+  await expect(hostPage.getByText('Bringing a friend later')).toBeVisible()
+  await hostPage.click('button:has-text("Approve")')
+  await expect(hostPage.getByText('At the table (1)')).toBeVisible()
+
+  // The approval created the payment row, at the price agreed at that moment.
+  const [payment] = await sql<{ amount: string }[]>`select amount from seat_payments`
+  expect(Number(payment.amount)).toBe(2_500_000)
+
+  // --- the guest marks it paid ---
+  await page.reload()
+  await expect(page.getByText("You're in")).toBeVisible()
+  await page.fill('input[name="method"]', 'GoPay')
+  await page.click('button:has-text("I\'ve paid")')
+  await expect(page.getByText('Waiting for Host to confirm')).toBeVisible()
+
+  // --- the host confirms ---
+  await hostPage.reload()
+  await expect(hostPage.getByText('Says paid')).toBeVisible()
+  await hostPage.click('button:has-text("Mark received")')
+  await expect(hostPage.getByText('Paid', { exact: true })).toBeVisible()
+  await expect(hostPage.getByText('Still to collect Rp 0')).toBeVisible()
+
+  // --- the guest sees it settled ---
+  await page.reload()
+  await expect(page.getByText('confirmed your payment')).toBeVisible()
+
+  await page.goto('/me')
+  await expect(page.getByText('Paid', { exact: true })).toBeVisible()
+
+  // Every one of those steps ran with a deliberately broken email sender. That
+  // the flow completed at all is the proof that email is best-effort.
+  const logged = await sql`select kind from email_log`
+  expect(logged).toHaveLength(0)
+
+  await hostContext.close()
+})
+
+test('the last seat cannot be sold twice', async ({ browser, page, context, asMember }) => {
+  const host = await createMember('Host')
+  const first = await createMember('First')
+  const second = await createMember('Second')
+  const venueId = await createVenue('Savaya')
+
+  const [listing] = await sql<{ id: string }[]>`
+    insert into table_listings (host_id, venue_id, starts_at, seats_offered, seat_price)
+    values (${host.id}, ${venueId}, now() + interval '10 days', 1, 2500000)
+    returning id
+  `
+  for (const guest of [first, second]) {
+    await sql`
+      insert into seat_requests (table_id, host_id, user_id)
+      values (${listing.id}, ${host.id}, ${guest.id})
+    `
+  }
+
+  await asMember(context, host)
+  await page.goto(`/tables/${listing.id}/manage`)
+
+  const approveButtons = page.locator('button:has-text("Approve")')
+  await approveButtons.first().click()
+  await expect(page.getByText('At the table (1)')).toBeVisible()
+
+  await page.locator('button:has-text("Approve")').first().click()
+  await expect(page.getByRole('alert')).toContainText('just filled up')
+
+  const approved = await sql`select id from seat_requests where status = 'approved'`
+  expect(approved).toHaveLength(1)
+
+  // The second guest, still pending, sees the table as full rather than as broken.
+  const guestContext = await browser.newContext()
+  await asMember(guestContext, second)
+  const guestPage = await guestContext.newPage()
+  await guestPage.goto(`/tables/${listing.id}`)
+  await expect(guestPage.getByText('will decide')).toBeVisible()
+
+  await guestContext.close()
+})
+```
+
+- [ ] **Step 8: Path four — cancelling cascades**
+
+Create `e2e/cancel-cascades.spec.ts`:
+
+```ts
+import { createMember, createVenue, seatStatuses, sql } from './support/db'
+import { expect, test } from './support/fixtures'
+
+test('cancelling a table releases everyone and says so', async ({ browser, page, context, asMember }) => {
+  const host = await createMember('Host')
+  const approved = await createMember('Approved')
+  const waiting = await createMember('Waiting')
+  const venueId = await createVenue('Savaya')
+
+  const [listing] = await sql<{ id: string }[]>`
+    insert into table_listings (host_id, venue_id, starts_at, seats_offered, seat_price)
+    values (${host.id}, ${venueId}, now() + interval '10 days', 4, 2500000)
+    returning id
+  `
+  await sql`
+    insert into seat_requests (table_id, host_id, user_id, status)
+    values (${listing.id}, ${host.id}, ${approved.id}, 'approved')
+  `
+  await sql`
+    insert into seat_payments (seat_request_id, amount, marked_paid_at, confirmed_at, confirmed_by)
+    select id, 2500000, now(), now(), ${host.id} from seat_requests where user_id = ${approved.id}
+  `
+  await sql`
+    insert into seat_requests (table_id, host_id, user_id, status)
+    values (${listing.id}, ${host.id}, ${waiting.id}, 'pending')
+  `
+
+  await asMember(context, host)
+  await page.goto(`/tables/${listing.id}/manage`)
+
+  // Two deliberate taps: the disclosure, then the destructive button inside it.
+  await page.click('summary:has-text("Cancel this table")')
+  await page.click('button:has-text("Yes, cancel the table")')
+
+  await expect(page).toHaveURL(`/tables/${listing.id}`)
+  await expect(page.getByText('This table was cancelled')).toBeVisible()
+
+  const statuses = Object.fromEntries(
+    (await seatStatuses(listing.id)).map((row) => [row.user_id, row.status]),
+  )
+  expect(statuses[approved.id]).toBe('removed')
+  expect(statuses[waiting.id]).toBe('declined')
+
+  // The cancelled table leaves the feed entirely.
+  await page.goto('/')
+  await expect(page.getByText('No tables coming up')).toBeVisible()
+
+  // The guest who paid still sees the table, and it is not offering them anything.
+  const guestContext = await browser.newContext()
+  await asMember(guestContext, approved)
+  const guestPage = await guestContext.newPage()
+  await guestPage.goto(`/tables/${listing.id}`)
+  await expect(guestPage.getByText('This table was cancelled')).toBeVisible()
+  await expect(guestPage.locator('button:has-text("Ask for a seat")')).toHaveCount(0)
+
+  await guestContext.close()
+})
+```
+
+- [ ] **Step 9: Run them**
+
+```bash
+npm run test:e2e
+```
+
+Expected: 6 tests across 4 files, all passing.
+
+If every test fails with a redirect to `/login`, the session cookie name in `e2e/support/fixtures.ts` is wrong for your Auth.js version. Sign in by hand at `http://localhost:3000`, then read the name back:
+
+```bash
+# In the browser devtools console on the signed-in page:
+document.cookie
+# Or, more reliably, check Application → Cookies for the httpOnly one.
+```
+
+Fix `SESSION_COOKIE` to match and re-run. Do not work around it by adding a test-only sign-in route — that route would exist in production.
+
+- [ ] **Step 10: Commit and push**
+
+```bash
+git add playwright.config.ts e2e package.json package-lock.json .env.example .gitignore
+git commit -m "test: add four end-to-end paths with Playwright"
+git push
+```
+
+---
