@@ -2400,6 +2400,7 @@ git push
 Create `tests/integration/email-log-repository.test.ts`:
 
 ```ts
+import { randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { db } from '@/lib/db/client'
 import { PostgresEmailLogRepository, PostgresRecipientRepository } from '@/lib/db/repositories/email-log'
@@ -2412,6 +2413,12 @@ const recipients = new PostgresRecipientRepository(db)
 
 const AT = new Date('2026-08-01T12:00:00.000Z')
 
+// `email_log.entity_id` is a uuid column, so these must be real uuids —
+// Postgres rejects 'request-1' outright with an invalid input syntax error.
+const REQUEST_A = randomUUID()
+const REQUEST_B = randomUUID()
+const LISTING_A = randomUUID()
+
 let aliceId: string
 let bobId: string
 
@@ -2423,25 +2430,25 @@ beforeEach(async () => {
 
 describe('claim', () => {
   it('succeeds the first time and fails the second', async () => {
-    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
-    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(false)
+    expect(await log.claim('seat_approved', REQUEST_A, aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_A, aliceId, AT)).toBe(false)
   })
 
   it('treats each recipient separately', async () => {
-    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
-    expect(await log.claim('seat_approved', 'request-1', bobId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_A, aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_A, bobId, AT)).toBe(true)
   })
 
   it('treats each kind and entity separately', async () => {
-    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
-    expect(await log.claim('seat_removed', 'request-1', aliceId, AT)).toBe(true)
-    expect(await log.claim('seat_approved', 'request-2', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_A, aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_removed', REQUEST_A, aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_B, aliceId, AT)).toBe(true)
   })
 
   it('lets exactly one of two simultaneous claims win', async () => {
     const [first, second] = await Promise.all([
-      log.claim('new_listing', 'listing-1', aliceId, AT),
-      log.claim('new_listing', 'listing-1', aliceId, AT),
+      log.claim('new_listing', LISTING_A, aliceId, AT),
+      log.claim('new_listing', LISTING_A, aliceId, AT),
     ])
 
     expect([first, second].filter(Boolean)).toHaveLength(1)
@@ -2450,24 +2457,24 @@ describe('claim', () => {
 
 describe('release', () => {
   it('frees a claim so it can be taken again', async () => {
-    await log.claim('seat_approved', 'request-1', aliceId, AT)
+    await log.claim('seat_approved', REQUEST_A, aliceId, AT)
 
-    await log.release('seat_approved', 'request-1', aliceId)
+    await log.release('seat_approved', REQUEST_A, aliceId)
 
-    expect(await log.claim('seat_approved', 'request-1', aliceId, AT)).toBe(true)
+    expect(await log.claim('seat_approved', REQUEST_A, aliceId, AT)).toBe(true)
   })
 
   it('is harmless when there is nothing to release', async () => {
-    await expect(log.release('seat_approved', 'never-claimed', aliceId)).resolves.toBeUndefined()
+    await expect(log.release('seat_approved', randomUUID(), aliceId)).resolves.toBeUndefined()
   })
 
   it('releases only the claim it names', async () => {
-    await log.claim('seat_approved', 'request-1', aliceId, AT)
-    await log.claim('seat_approved', 'request-1', bobId, AT)
+    await log.claim('seat_approved', REQUEST_A, aliceId, AT)
+    await log.claim('seat_approved', REQUEST_A, bobId, AT)
 
-    await log.release('seat_approved', 'request-1', aliceId)
+    await log.release('seat_approved', REQUEST_A, aliceId)
 
-    expect(await log.claim('seat_approved', 'request-1', bobId, AT)).toBe(false)
+    expect(await log.claim('seat_approved', REQUEST_A, bobId, AT)).toBe(false)
   })
 })
 
