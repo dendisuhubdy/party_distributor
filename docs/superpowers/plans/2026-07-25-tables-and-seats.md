@@ -327,7 +327,9 @@ describe('findOrCreateVenue', () => {
 
 - [ ] **Step 5: Write the shared fake repository**
 
-Create `tests/support/fake-party-repository.ts`. It implements both ports over one store; the seats half is unused until Task 7 but is written now so the two halves cannot drift.
+Create `tests/support/fake-party-repository.ts`. It implements both ports over one store; the seats half is unused until Task 6 but is written now so the two halves cannot drift.
+
+Every import from `@/lib/domain/seats/**` below is `import type`, and those modules do not exist until Task 6. That is fine: esbuild erases type-only imports before Vitest runs them, so these tests pass now and the seats half of the class starts type-checking the moment Task 6 lands. If your editor shows red squiggles on those lines until then, that is expected.
 
 ```ts
 import type {
@@ -1205,7 +1207,7 @@ git commit -m "feat: derive listing state and add the feed query"
 
 **Interfaces:**
 - Consumes: `TablesDeps`, `TableListing` (Task 1); `assertWholeRupiah` (this task); `DomainError`.
-- Produces: `createListing(deps, input): Promise<TableListing>`; `MAX_SEATS_OFFERED = 20`; `MAX_EVENT_NAME_LENGTH = 80`; `MAX_NOTES_LENGTH = 500`; `MAX_PAYMENT_NOTE_LENGTH = 200`; `interface CreateListingInput`.
+- Produces: `createListing(deps, input): Promise<TableListing>`; `interface CreateListingInput`; `MAX_SEATS_OFFERED = 20`; `MAX_EVENT_NAME_LENGTH = 80`; `MAX_NOTES_LENGTH = 500`; `MAX_PAYMENT_NOTE_LENGTH = 200`. Also exports four validators that Task 5 reuses so edits and creations cannot diverge: `cleanText(value, max, label): string | null`, `cleanPaymentLink(value): string | null`, `assertSeatPrice(seatPrice): void`, `assertSeatsOffered(seatsOffered): void`.
 
 - [ ] **Step 1: Export the rupiah assertion**
 
@@ -2624,10 +2626,11 @@ git push
 
 - [ ] **Step 1: Extend the database test helpers**
 
-Add to `tests/support/db-helpers.ts`:
+Add to `tests/support/db-helpers.ts`. The file already imports `users` from `@/lib/db/schema` — extend that existing import rather than adding a second one from the same module.
 
 ```ts
-import { seatRequests, tableListings, venues } from '@/lib/db/schema'
+// existing: import { users } from '@/lib/db/schema'
+import { seatRequests, tableListings, users, venues } from '@/lib/db/schema'
 import type { SeatRequestStatus } from '@/lib/domain/seats/types'
 
 export async function seedVenue(overrides: Partial<{ name: string; city: string }> = {}) {
@@ -3092,7 +3095,11 @@ export class PostgresTablesRepository implements TablesRepository {
       return listing
     }
 
-    const [row] = await this.db.update(tableListings).set(values)
+    // The cast is needed because Object.fromEntries widens to
+    // Record<string, unknown>. Every key came from ListingPatch, whose fields
+    // are a strict subset of the insert type, so the shape is already correct.
+    const [row] = await this.db.update(tableListings)
+      .set(values as Partial<typeof tableListings.$inferInsert>)
       .where(eq(tableListings.id, listingId)).returning()
     return toListing(row)
   }
