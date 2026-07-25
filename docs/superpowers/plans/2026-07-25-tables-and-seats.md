@@ -1861,3 +1861,752 @@ git push
 ```
 
 ---
+
+### Task 6: Seat requests — asking and withdrawing
+
+**Files:**
+- Create: `lib/domain/seats/types.ts`, `lib/domain/seats/ports.ts`, `lib/domain/seats/request-seat.ts`
+- Test: `tests/domain/seats/request-seat.test.ts`
+
+**Interfaces:**
+- Consumes: `TablesDeps`-adjacent types from Task 1; `deriveListingState` (Task 3).
+- Produces: `SeatRequestStatus`, `SeatRequest`, `RosterEntry`, `HeldSeat`, `SeatListing`, `NewSeatRequest`, `ApproveOutcome`, `SeatsRepository`, `SeatsDeps`; `requestSeat(deps, input): Promise<SeatRequest>`; `withdrawSeat(deps, input): Promise<SeatRequest>`; `MAX_SEAT_MESSAGE_LENGTH = 280`.
+
+- [ ] **Step 1: Define the seats types**
+
+Create `lib/domain/seats/types.ts`:
+
+```ts
+import type { ListingSummary } from '../tables/types'
+
+export type SeatRequestStatus = 'pending' | 'approved' | 'declined' | 'withdrawn' | 'removed'
+
+export interface SeatRequest {
+  id: string
+  tableId: string
+  /**
+   * A denormalized copy of the listing's host, held honest by the composite
+   * foreign key `seat_requests_table_host_fk`. It exists so that "a host cannot
+   * take a seat at their own table" can be a CHECK constraint — a CHECK cannot
+   * reference another table. Never write it from application code; the
+   * repository copies it from the listing.
+   */
+  hostId: string
+  userId: string
+  message: string | null
+  status: SeatRequestStatus
+  decidedAt: Date | null
+  decidedBy: string | null
+  createdAt: Date
+}
+
+export interface RosterEntry {
+  request: SeatRequest
+  user: { id: string; name: string; instagramHandle: string | null }
+}
+
+export interface HeldSeat {
+  request: SeatRequest
+  listing: ListingSummary
+}
+```
+
+- [ ] **Step 2: Define the seats port**
+
+Create `lib/domain/seats/ports.ts`:
+
+```ts
+import type { Rupiah } from '../money'
+import type { ListingStatus } from '../tables/types'
+import type { HeldSeat, RosterEntry, SeatRequest, SeatRequestStatus } from './types'
+
+/** The slice of a listing that seat decisions actually need. */
+export interface SeatListing {
+  id: string
+  hostId: string
+  startsAt: Date
+  seatsOffered: number
+  seatPrice: Rupiah
+  status: ListingStatus
+}
+
+export interface NewSeatRequest {
+  tableId: string
+  hostId: string
+  userId: string
+  message: string | null
+}
+
+export type ApproveOutcome =
+  | { ok: true; request: SeatRequest }
+  | { ok: false; reason: 'table_full' | 'already_decided' }
+
+export interface SeatsRepository {
+  findListingForSeats(listingId: string): Promise<SeatListing | null>
+  findActiveRequest(listingId: string, userId: string): Promise<SeatRequest | null>
+  countApprovedSeats(listingId: string): Promise<number>
+  insertRequest(input: NewSeatRequest): Promise<SeatRequest>
+  findRequestById(requestId: string): Promise<SeatRequest | null>
+  /** Every request ever made against the listing, oldest first. */
+  listRequestsForListing(listingId: string): Promise<RosterEntry[]>
+  /** This member's live seats — pending and approved — soonest event first. */
+  listSeatsHeldBy(userId: string): Promise<HeldSeat[]>
+
+  /**
+   * Atomically: take a row lock on the listing, count approved seats, and
+   * approve the request only if a seat remains. Also records the seat's price
+   * as it stands right now.
+   *
+   * Callers MUST NOT count seats themselves and then call this. Any count taken
+   * outside the lock is stale by the time it returns — that is precisely the
+   * oversell bug this method exists to make impossible. A caller's own count is
+   * useful only for rendering a number on a page.
+   *
+   * `{ ok: false, reason: 'already_decided' }` means the request left `pending`
+   * between the caller's read and this call. It is distinguished from
+   * `'table_full'` because the two produce different, and both actionable,
+   * messages for the host.
+   */
+  approveIfSeatAvailable(requestId: string, decidedBy: string, at: Date): Promise<ApproveOutcome>
+
+  setRequestStatus(
+    requestId: string, status: SeatRequestStatus, at: Date, decidedBy: string,
+  ): Promise<SeatRequest>
+}
+
+export interface SeatsDeps {
+  repository: SeatsRepository
+  now: () => Date
+}
+```
+
+- [ ] **Step 3: Write the failing tests**
+
+Create `tests/domain/seats/request-seat.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { MAX_SEAT_MESSAGE_LENGTH, requestSeat, withdrawSeat } from '@/lib/domain/seats/request-seat'
+import { FakePartyRepository } from '../../support/fake-party-repository'
+
+const NOW = new Date('2026-08-01T12:00:00Z')
+const LATER = new Date('2026-09-01T14:00:00Z')
+
+let repository: FakePartyRepository
+let hostId: string
+let guestId: string
+let otherId: string
+
+const deps = () => ({ repository, now: () => NOW })
+
+beforeEach(() => {
+  repository = new FakePartyRepository()
+  hostId = repository.seedUser({ name: 'Host' }).id
+  guestId = repository.seedUser({ name: 'Guest' }).id
+  otherId = repository.seedUser({ name: 'Other' }).id
+})
+
+const openListing = (overrides = {}) =>
+  repository.seedListing({ hostId, startsAt: LATER, seatsOffered: 2, ...overrides })
+
+describe('requestSeat', () => {
+  it('creates a pending request carrying the guest and the host', async () => {
+    const listing = openListing()
+
+    const request = await requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null })
+
+    expect(request.status).toBe('pending')
+    expect(request.userId).toBe(guestId)
+    expect(request.hostId).toBe(hostId)
+    expect(request.tableId).toBe(listing.id)
+    expect(request.decidedAt).toBeNull()
+  })
+
+  it('keeps a short note for the host and drops a blank one', async () => {
+    const listing = openListing()
+
+    const withNote = await requestSeat(deps(), {
+      listingId: listing.id, userId: guestId, message: '  Bringing a friend later  ',
+    })
+    expect(withNote.message).toBe('Bringing a friend later')
+
+    const blank = await requestSeat(deps(), { listingId: listing.id, userId: otherId, message: '   ' })
+    expect(blank.message).toBeNull()
+  })
+
+  it('rejects a note longer than the limit', async () => {
+    const listing = openListing()
+
+    await expect(requestSeat(deps(), {
+      listingId: listing.id, userId: guestId, message: 'x'.repeat(MAX_SEAT_MESSAGE_LENGTH + 1),
+    })).rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
+  it('refuses a table that does not exist', async () => {
+    await expect(requestSeat(deps(), { listingId: 'nope', userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'listing_not_found' })
+  })
+
+  it('refuses a cancelled table', async () => {
+    const listing = openListing({ status: 'cancelled' })
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'listing_cancelled' })
+  })
+
+  it('refuses a table that has already started', async () => {
+    const listing = openListing({ startsAt: new Date('2026-07-01T14:00:00Z') })
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+
+  it('refuses the host a seat at their own table', async () => {
+    const listing = openListing()
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: hostId, message: null }))
+      .rejects.toMatchObject({ code: 'host_cannot_join_own_table' })
+  })
+
+  it('refuses a second request while one is still pending', async () => {
+    const listing = openListing()
+    await requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null })
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'duplicate_seat_request' })
+  })
+
+  it('refuses a second request from someone already approved', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'duplicate_seat_request' })
+  })
+
+  it('lets someone ask again after being declined', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'declined' })
+
+    const request = await requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null })
+
+    expect(request.status).toBe('pending')
+  })
+
+  it('lets someone ask again after withdrawing', async () => {
+    const listing = openListing()
+    repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'withdrawn' })
+
+    const request = await requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null })
+
+    expect(request.status).toBe('pending')
+  })
+
+  it('refuses a table with every seat approved', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    repository.seedRequest({ tableId: listing.id, userId: otherId, status: 'approved' })
+
+    await expect(requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null }))
+      .rejects.toMatchObject({ code: 'table_full' })
+  })
+
+  it('allows more pending requests than there are seats', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    await requestSeat(deps(), { listingId: listing.id, userId: guestId, message: null })
+
+    const second = await requestSeat(deps(), { listingId: listing.id, userId: otherId, message: null })
+
+    expect(second.status).toBe('pending')
+  })
+})
+
+describe('withdrawSeat', () => {
+  it('withdraws a pending request', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'pending' })
+
+    const updated = await withdrawSeat(deps(), { requestId: request.id, userId: guestId })
+
+    expect(updated.status).toBe('withdrawn')
+    expect(updated.decidedAt).toEqual(NOW)
+    expect(updated.decidedBy).toBe(guestId)
+  })
+
+  it('withdraws an approved seat, freeing it for someone else', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await withdrawSeat(deps(), { requestId: request.id, userId: guestId })
+
+    expect(await repository.countApprovedSeats(listing.id)).toBe(0)
+  })
+
+  it('refuses to let one guest withdraw another guest', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'pending' })
+
+    await expect(withdrawSeat(deps(), { requestId: request.id, userId: otherId }))
+      .rejects.toMatchObject({ code: 'not_seat_owner' })
+  })
+
+  it('refuses a request that does not exist', async () => {
+    await expect(withdrawSeat(deps(), { requestId: 'nope', userId: guestId }))
+      .rejects.toMatchObject({ code: 'seat_request_not_found' })
+  })
+
+  it('refuses a request that is already settled', async () => {
+    const listing = openListing()
+    for (const status of ['declined', 'withdrawn', 'removed'] as const) {
+      const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status })
+
+      await expect(
+        withdrawSeat(deps(), { requestId: request.id, userId: guestId }),
+        `expected withdrawing a ${status} request to be rejected`,
+      ).rejects.toMatchObject({ code: 'seat_request_already_decided' })
+    }
+  })
+
+  it('refuses to withdraw from a table that has already started', async () => {
+    const listing = openListing({ startsAt: new Date('2026-07-01T14:00:00Z') })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(withdrawSeat(deps(), { requestId: request.id, userId: guestId }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+})
+```
+
+Two of these encode product rules worth stating plainly. Declined and withdrawn people *may* ask again — the partial unique index only covers `pending` and `approved`, and a host who declined someone once because the table was nearly full should be able to change their mind. And pending requests may outnumber seats, because the host picks who joins; capping requests at the seat count would turn approval into a race between guests, which is exactly the dynamic hosting is meant to remove.
+
+- [ ] **Step 4: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/seats/request-seat`.
+
+- [ ] **Step 5: Implement**
+
+Create `lib/domain/seats/request-seat.ts`:
+
+```ts
+import { DomainError } from '../errors'
+import { deriveListingState } from '../tables/derive'
+import type { SeatListing, SeatsDeps } from './ports'
+import type { SeatRequest } from './types'
+
+export const MAX_SEAT_MESSAGE_LENGTH = 280
+
+export interface RequestSeatInput {
+  listingId: string
+  userId: string
+  message: string | null
+}
+
+export interface WithdrawSeatInput {
+  requestId: string
+  userId: string
+}
+
+async function loadListing(deps: SeatsDeps, listingId: string): Promise<SeatListing> {
+  const listing = await deps.repository.findListingForSeats(listingId)
+  if (!listing) {
+    throw new DomainError('listing_not_found', 'That table no longer exists.')
+  }
+  return listing
+}
+
+export async function requestSeat(deps: SeatsDeps, input: RequestSeatInput): Promise<SeatRequest> {
+  const listing = await loadListing(deps, input.listingId)
+  const approvedSeats = await deps.repository.countApprovedSeats(listing.id)
+  const state = deriveListingState(listing, approvedSeats, deps.now())
+
+  if (state.isCancelled) {
+    throw new DomainError('listing_cancelled', 'That table was cancelled.')
+  }
+  if (state.isPast) {
+    throw new DomainError('listing_past', 'That table has already started.')
+  }
+  if (input.userId === listing.hostId) {
+    // Also a CHECK constraint in the database. Enforced here so the host gets a
+    // sentence instead of a constraint violation.
+    throw new DomainError('host_cannot_join_own_table', "It's your table — you're already there.")
+  }
+
+  const active = await deps.repository.findActiveRequest(listing.id, input.userId)
+  if (active) {
+    throw new DomainError(
+      'duplicate_seat_request',
+      active.status === 'approved' ? "You already have a seat at this table." : "You've already asked for a seat here.",
+    )
+  }
+
+  if (state.isFull) {
+    throw new DomainError('table_full', 'This table just filled up.')
+  }
+
+  const message = (input.message ?? '').trim()
+  if (message.length > MAX_SEAT_MESSAGE_LENGTH) {
+    throw new DomainError('invalid_input', `Keep your note under ${MAX_SEAT_MESSAGE_LENGTH} characters.`)
+  }
+
+  return deps.repository.insertRequest({
+    tableId: listing.id,
+    hostId: listing.hostId,
+    userId: input.userId,
+    message: message.length > 0 ? message : null,
+  })
+}
+
+export async function withdrawSeat(deps: SeatsDeps, input: WithdrawSeatInput): Promise<SeatRequest> {
+  const request = await deps.repository.findRequestById(input.requestId)
+  if (!request) {
+    throw new DomainError('seat_request_not_found', 'That request no longer exists.')
+  }
+  if (request.userId !== input.userId) {
+    throw new DomainError('not_seat_owner', 'That seat is not yours to withdraw.')
+  }
+  if (request.status !== 'pending' && request.status !== 'approved') {
+    throw new DomainError('seat_request_already_decided', 'That request is already settled.')
+  }
+
+  const listing = await loadListing(deps, request.tableId)
+  if (deriveListingState(listing, 0, deps.now()).isPast) {
+    throw new DomainError('listing_past', 'That table has already started.')
+  }
+
+  return deps.repository.setRequestStatus(request.id, 'withdrawn', deps.now(), input.userId)
+}
+```
+
+- [ ] **Step 6: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+Expected: all request-seat tests pass. The lint run matters here — `lib/domain/seats` is new, and this is the first chance for a stray framework import to appear in it.
+
+- [ ] **Step 7: Commit and push**
+
+```bash
+git add lib/domain/seats tests/domain/seats
+git commit -m "feat: add seat requests and withdrawal"
+git push
+```
+
+---
+
+### Task 7: Host decisions — approve, decline, remove
+
+**Files:**
+- Create: `lib/domain/seats/decide-seat.ts`
+- Test: `tests/domain/seats/decide-seat.test.ts`
+
+**Interfaces:**
+- Consumes: `SeatsDeps`, `ApproveOutcome` (Task 6); `deriveListingState` (Task 3).
+- Produces: `approveSeat(deps, input): Promise<SeatRequest>`; `declineSeat(deps, input): Promise<SeatRequest>`; `removeSeat(deps, input): Promise<SeatRequest>`; `interface DecideSeatInput { requestId, hostId }`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/domain/seats/decide-seat.test.ts`:
+
+```ts
+import { beforeEach, describe, expect, it } from 'vitest'
+import { approveSeat, declineSeat, removeSeat } from '@/lib/domain/seats/decide-seat'
+import { FakePartyRepository } from '../../support/fake-party-repository'
+
+const NOW = new Date('2026-08-01T12:00:00Z')
+const LATER = new Date('2026-09-01T14:00:00Z')
+
+let repository: FakePartyRepository
+let hostId: string
+let strangerId: string
+let guestId: string
+
+const deps = () => ({ repository, now: () => NOW })
+
+beforeEach(() => {
+  repository = new FakePartyRepository()
+  hostId = repository.seedUser({ name: 'Host' }).id
+  strangerId = repository.seedUser({ name: 'Stranger' }).id
+  guestId = repository.seedUser({ name: 'Guest' }).id
+})
+
+const openListing = (overrides = {}) =>
+  repository.seedListing({ hostId, startsAt: LATER, seatsOffered: 2, ...overrides })
+
+describe('approveSeat', () => {
+  it('approves a pending request and stamps who decided it, and when', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    const approved = await approveSeat(deps(), { requestId: request.id, hostId })
+
+    expect(approved.status).toBe('approved')
+    expect(approved.decidedBy).toBe(hostId)
+    expect(approved.decidedAt).toEqual(NOW)
+  })
+
+  it('refuses anyone who is not the host of that table', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    await expect(approveSeat(deps(), { requestId: request.id, hostId: strangerId }))
+      .rejects.toMatchObject({ code: 'not_listing_host' })
+  })
+
+  it('refuses a request that does not exist', async () => {
+    await expect(approveSeat(deps(), { requestId: 'nope', hostId }))
+      .rejects.toMatchObject({ code: 'seat_request_not_found' })
+  })
+
+  it('refuses a request that was already settled', async () => {
+    const listing = openListing()
+    for (const status of ['approved', 'declined', 'withdrawn', 'removed'] as const) {
+      const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status })
+
+      await expect(
+        approveSeat(deps(), { requestId: request.id, hostId }),
+        `expected approving a ${status} request to be rejected`,
+      ).rejects.toMatchObject({ code: 'seat_request_already_decided' })
+    }
+  })
+
+  it('refuses on a cancelled or already-started table', async () => {
+    const cancelled = openListing({ status: 'cancelled' })
+    const a = repository.seedRequest({ tableId: cancelled.id, userId: guestId })
+    await expect(approveSeat(deps(), { requestId: a.id, hostId }))
+      .rejects.toMatchObject({ code: 'listing_cancelled' })
+
+    const past = openListing({ startsAt: new Date('2026-07-01T14:00:00Z') })
+    const b = repository.seedRequest({ tableId: past.id, userId: guestId })
+    await expect(approveSeat(deps(), { requestId: b.id, hostId }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+
+  it('reports a full table rather than overselling it', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    repository.seedRequest({ tableId: listing.id, userId: strangerId, status: 'approved' })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    await expect(approveSeat(deps(), { requestId: request.id, hostId }))
+      .rejects.toMatchObject({ code: 'table_full' })
+  })
+
+  it('trusts the repository over its own count when the two disagree', async () => {
+    // The repository is the only thing holding the lock. If it says the table
+    // filled up between our read and our write, that is the truth.
+    const listing = openListing({ seatsOffered: 4 })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+    repository.forceApprovalFull = true
+
+    await expect(approveSeat(deps(), { requestId: request.id, hostId }))
+      .rejects.toMatchObject({ code: 'table_full' })
+  })
+
+  it('fills the last seat successfully', async () => {
+    const listing = openListing({ seatsOffered: 2 })
+    repository.seedRequest({ tableId: listing.id, userId: strangerId, status: 'approved' })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    const approved = await approveSeat(deps(), { requestId: request.id, hostId })
+
+    expect(approved.status).toBe('approved')
+    expect(await repository.countApprovedSeats(listing.id)).toBe(2)
+  })
+})
+
+describe('declineSeat', () => {
+  it('declines a pending request', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    const declined = await declineSeat(deps(), { requestId: request.id, hostId })
+
+    expect(declined.status).toBe('declined')
+    expect(declined.decidedBy).toBe(hostId)
+  })
+
+  it('declines even when the table is full, because that is the useful case', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    repository.seedRequest({ tableId: listing.id, userId: strangerId, status: 'approved' })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    const declined = await declineSeat(deps(), { requestId: request.id, hostId })
+
+    expect(declined.status).toBe('declined')
+  })
+
+  it('refuses anyone who is not the host', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId })
+
+    await expect(declineSeat(deps(), { requestId: request.id, hostId: strangerId }))
+      .rejects.toMatchObject({ code: 'not_listing_host' })
+  })
+
+  it('refuses a request that is not pending', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(declineSeat(deps(), { requestId: request.id, hostId }))
+      .rejects.toMatchObject({ code: 'seat_request_already_decided' })
+  })
+})
+
+describe('removeSeat', () => {
+  it('removes an approved guest and frees their seat', async () => {
+    const listing = openListing({ seatsOffered: 1 })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    const removed = await removeSeat(deps(), { requestId: request.id, hostId })
+
+    expect(removed.status).toBe('removed')
+    expect(removed.decidedBy).toBe(hostId)
+    expect(await repository.countApprovedSeats(listing.id)).toBe(0)
+  })
+
+  it('refuses to remove someone who is only pending — decline them instead', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'pending' })
+
+    await expect(removeSeat(deps(), { requestId: request.id, hostId }))
+      .rejects.toMatchObject({ code: 'seat_request_already_decided' })
+  })
+
+  it('refuses anyone who is not the host', async () => {
+    const listing = openListing()
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(removeSeat(deps(), { requestId: request.id, hostId: strangerId }))
+      .rejects.toMatchObject({ code: 'not_listing_host' })
+  })
+
+  it('refuses to remove anyone once the table has started', async () => {
+    const listing = openListing({ startsAt: new Date('2026-07-01T14:00:00Z') })
+    const request = repository.seedRequest({ tableId: listing.id, userId: guestId, status: 'approved' })
+
+    await expect(removeSeat(deps(), { requestId: request.id, hostId }))
+      .rejects.toMatchObject({ code: 'listing_past' })
+  })
+})
+```
+
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+```bash
+npm test
+```
+
+Expected: failure resolving `@/lib/domain/seats/decide-seat`.
+
+- [ ] **Step 3: Implement**
+
+Create `lib/domain/seats/decide-seat.ts`:
+
+```ts
+import { DomainError } from '../errors'
+import { deriveListingState } from '../tables/derive'
+import type { SeatListing, SeatsDeps } from './ports'
+import type { SeatRequest } from './types'
+
+export interface DecideSeatInput {
+  requestId: string
+  hostId: string
+}
+
+/**
+ * Load a request together with its listing, having verified the caller is the
+ * host and the table is still live. Every host decision starts here.
+ */
+async function loadForDecision(
+  deps: SeatsDeps, input: DecideSeatInput,
+): Promise<{ request: SeatRequest; listing: SeatListing }> {
+  const request = await deps.repository.findRequestById(input.requestId)
+  if (!request) {
+    throw new DomainError('seat_request_not_found', 'That request no longer exists.')
+  }
+
+  const listing = await deps.repository.findListingForSeats(request.tableId)
+  if (!listing) {
+    throw new DomainError('listing_not_found', 'That table no longer exists.')
+  }
+  if (listing.hostId !== input.hostId) {
+    throw new DomainError('not_listing_host', 'Only the host can decide who joins this table.')
+  }
+
+  const state = deriveListingState(listing, 0, deps.now())
+  if (state.isCancelled) {
+    throw new DomainError('listing_cancelled', 'That table was cancelled.')
+  }
+  if (state.isPast) {
+    throw new DomainError('listing_past', 'That table has already started.')
+  }
+
+  return { request, listing }
+}
+
+function assertPending(request: SeatRequest): void {
+  if (request.status !== 'pending') {
+    throw new DomainError('seat_request_already_decided', 'You already decided on this request.')
+  }
+}
+
+export async function approveSeat(deps: SeatsDeps, input: DecideSeatInput): Promise<SeatRequest> {
+  const { request } = await loadForDecision(deps, input)
+  assertPending(request)
+
+  // No seat count is taken here on purpose. The repository takes a row lock on
+  // the listing and counts inside it; a count taken out here would be stale by
+  // the time the write lands, which is the entire oversell bug.
+  const outcome = await deps.repository.approveIfSeatAvailable(request.id, input.hostId, deps.now())
+
+  if (!outcome.ok) {
+    if (outcome.reason === 'table_full') {
+      throw new DomainError('table_full', 'This table just filled up.')
+    }
+    throw new DomainError('seat_request_already_decided', 'You already decided on this request.')
+  }
+
+  return outcome.request
+}
+
+export async function declineSeat(deps: SeatsDeps, input: DecideSeatInput): Promise<SeatRequest> {
+  const { request } = await loadForDecision(deps, input)
+  assertPending(request)
+
+  // Deliberately possible on a full table: declining the people who did not get
+  // a seat is the main reason a host opens this screen at all.
+  return deps.repository.setRequestStatus(request.id, 'declined', deps.now(), input.hostId)
+}
+
+export async function removeSeat(deps: SeatsDeps, input: DecideSeatInput): Promise<SeatRequest> {
+  const { request } = await loadForDecision(deps, input)
+
+  if (request.status !== 'approved') {
+    throw new DomainError('seat_request_already_decided', "That person doesn't hold a seat at this table.")
+  }
+
+  return deps.repository.setRequestStatus(request.id, 'removed', deps.now(), input.hostId)
+}
+```
+
+- [ ] **Step 4: Run the tests and confirm they pass**
+
+```bash
+npm test && npm run lint
+```
+
+Expected: every domain test in the project passes — Plan 1's and Plan 2's together.
+
+- [ ] **Step 5: Commit and push**
+
+```bash
+git add lib/domain/seats/decide-seat.ts tests/domain/seats/decide-seat.test.ts
+git commit -m "feat: add host approve, decline, and remove decisions"
+git push
+```
+
+---
