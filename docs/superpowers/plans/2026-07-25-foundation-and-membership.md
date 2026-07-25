@@ -3257,16 +3257,22 @@ git commit -m "chore: add Droplet deployment with Caddy TLS over sslip.io"
 
 ## Definition of done
 
-- [ ] `npm test`, `npm run test:integration`, `npm run lint`, and `npm run build` all pass.
-- [ ] The lint rule has been observed rejecting a framework import from `lib/domain`.
-- [ ] The concurrent-redemption test has been observed failing against a naive check-then-act implementation.
-- [ ] A stranger requesting a magic link receives nothing and creates no rows, verified in production.
-- [ ] `npm run db:seed` run twice produces no duplicates.
-- [ ] The production site serves a valid certificate on its `sslip.io` hostname.
-- [ ] A second account has redeemed a real code and signed in — via the token escape hatch, since the test sender cannot reach it.
+All verified on 2026-07-25 against the live deployment.
 
-**Not done, and known:** real members cannot sign themselves in until `EMAIL_FROM` points at a verified domain or an SMTP mailbox. Plan 2 is unblocked by this — listings, requests, and approvals can all be built and tested with seeded accounts — but the product cannot be handed to anyone until it is resolved.
+- [x] `npm test` (43), `npm run test:integration` (19), `npm run lint`, and `npm run build` all pass.
+- [x] The lint rule was observed rejecting a `next/server` import from `lib/domain`, then the import removed.
+- [x] The concurrent-redemption test was observed **failing with 2 winners** against a check-then-act implementation, and passing against compare-and-set. This required giving each racer its own client — see Task 6 Step 1.
+- [x] A stranger requesting a magic link receives nothing and creates no rows, verified in production: `AccessDenied`, zero `verification_tokens`, no `users` row.
+- [x] `npm run db:seed` run twice produces no duplicates, locally and in production.
+- [x] The production site serves a valid Let's Encrypt certificate for `wazup.party`; `http://` returns 308 and `www.` returns 301 to the apex.
+- [x] A second account redeemed a code, was attributed to its inviter, and received its own quota of three — run in production against a throwaway code so none of the founder's three was spent, then cleaned up.
+- [x] Postgres is not reachable from the internet (5432 closed); `ufw` allows only SSH, 80 and 443.
+- [x] A nightly `pg_dump` is installed and was proven to produce a dump containing all ten tables with data.
+
+**Done, and no longer a limitation:** `wazup.party` is a verified sending domain in Resend, so magic links reach any member's inbox. A live sign-in email was delivered from `hello@wazup.party`. The product can be handed to real people.
 
 ## What Plan 2 picks up
 
 Venue selection, listing creation, the feed, join requests, and the approval flow with the row-locked oversell guard. The `table_listings`, `seat_requests`, and `seat_payments` tables already exist with their constraints; Plan 2 writes the domain logic and screens on top of them.
+
+**Read Task 6 Step 1 first.** Plan 2's oversell test is the most load-bearing test in the project and it cannot detect a missing lock unless each concurrent approval runs on its own client.
